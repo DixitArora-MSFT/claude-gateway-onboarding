@@ -52,11 +52,6 @@ The scripts do not create Azure resources, deploy models, grant permissions, or
 bypass IT policies. This integration uses the dedicated public-Azure AI Gateway
 Anthropic endpoint, not arbitrary proxy URLs or direct Foundry API-key setup.
 
-On Macs, IT must preinstall the required software or provide existing approved
-Homebrew. Missing Python can be installed through that Homebrew. **The script
-never installs Homebrew.** Package availability, particularly on Intel or older
-macOS versions, remains an upstream constraint.
-
 ## Run the setup
 
 Save the appropriate script in your Downloads folder. Run as the normal user who
@@ -123,36 +118,6 @@ published aliases, not an assumed model name.
 Users do not need to fill in the Desktop connection screen manually. They still
 need to run setup, complete Microsoft sign-in/MFA, and approve normal installation
 prompts. Windows can require a restart; none is forced.
-
-## Costs and verification
-
-**No script-level model inference requests are made by default.** Setup checks
-sign-in and configuration, which does not prove model permissions, aliases,
-gateway quotas, or backend connectivity.
-
-For an intentional paid access check, use `-VerifyModels` on Windows or
-`--verify-models` on macOS. Each requests one small response per distinct supplied
-alias, with a maximum of 16 output tokens and no automatic inference retries.
-Opening or using the applications may generate their own requests and charges.
-
-Validate the selected applications with a small approved test before broad
-rollout. Offline checks are not a substitute for native installation, MFA,
-device readiness, and actual application testing.
-
-## Help and reauthentication
-
-Follow the launch instructions printed at the end of setup. If fresh Microsoft
-sign-in is needed, rerun onboarding and complete sign-in. Mac runtime helpers and
-Windows Code helpers never open interactive sign-in windows.
-
-If setup fails, contact IT with the error message. Do not share access tokens,
-authentication-cache files, passwords, or raw helper output. Do not weaken
-execution policies, managed settings, workspace trust, or other security
-controls to make setup proceed.
-
-Configuration rollback does not uninstall software, undo sign-in, or guarantee
-recovery from power loss. Shared Code user settings configure one active gateway
-per OS user; project or managed settings can take precedence.
 
 ## References
 
