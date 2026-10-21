@@ -12,6 +12,16 @@ are included. Your administrator supplies the connection details.
 > device and application pilots before customer rollout. AI Gateway tier is in
 > public preview. Neither script guarantees zero failures on every device.
 
+## Customer onboarding guide
+
+[Download the customer onboarding guide (Word)](docs/AI-Gateway-Customer-Onboarding-Guide.docx).
+Open the file and choose **Download raw file** to save it.
+
+The guide covers administrator preparation, where to find the connection details,
+and setup steps for users. Customer-specific values are placeholders; IT supplies
+the approved configuration. Personal editor metadata has been removed from this
+published copy.
+
 ## Choose your script
 
 | Platform | Download | Requirements |
