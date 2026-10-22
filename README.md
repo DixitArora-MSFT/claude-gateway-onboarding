@@ -99,25 +99,21 @@ to enter technical details. The parameters are:
 Both scripts accept a quoted comma-separated list of aliases. Use the complete
 published aliases, not an assumed model name.
 
-## What setup does
+## What the setup does for you
 
-- Installs or updates missing/incompatible prerequisites and the selected
-  applications through the approved package manager: WinGet on Windows,
-  existing Homebrew on macOS.
-- Installs the official `anthropic.claude-code` extension when VS Code is selected.
-  VS Code-only setup does not install the standalone Claude Code CLI.
-- Creates local credential helpers using delegated Microsoft Entra tokens.
-- For Desktop, saves and selects the Gateway profile, Helper script credential
-  kind, Bearer scheme, gateway URL, helper path, and model list automatically.
-- Configures the corresponding user settings for CLI and VS Code when selected.
-- Preserves unrelated settings, creates backups of replaced configuration, and
-  attempts rollback after reported configuration-update failures.
-- Stops for incompatible managed settings or conflicting credentials instead of
-  overriding organizational controls.
+- Checks for required software and installs or updates it where your IT policies
+  allow.
+- Sets up the Claude application or applications you choose.
+- Saves your company's connection details and approved model list, so you do not
+  need to fill in the Claude Desktop settings yourself.
+- Keeps unrelated settings and backs up existing files before changing them.
+- Stops and asks for IT assistance if settings conflict or company policies
+  prevent setup.
 
-Users do not need to fill in the Desktop connection screen manually. They still
-need to run setup, complete Microsoft sign-in/MFA, and approve normal installation
-prompts. Windows can require a restart; none is forced.
+**What you need to do:** Run the command supplied by IT, sign in with your work
+account if prompted, and complete any required approval or verification steps.
+Follow the instructions to close or reopen applications. If Windows needs a
+restart, the script will tell you; it will not restart your computer automatically.
 
 ## References
 
