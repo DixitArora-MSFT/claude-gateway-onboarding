@@ -39,14 +39,17 @@ Your Azure/IT administrator must:
 1. Publish the intended Foundry Claude models through the dedicated AI Gateway.
 2. Configure and authorize the gateway's backend managed identity.
 3. Grant approved users, preferably through an Entra group, **AI Gateway Models
-   User** access at the appropriate gateway or model scope.
+   User** access at the appropriate gateway or model scope. For automatic model
+   discovery, also grant **Reader** on this gateway (or equivalent scoped catalog
+   and effective-permission read access). Reader does not grant model invocation.
 4. Resolve required consent, MFA, Conditional Access, and device-compliance
    requirements for Azure CLI's delegated
    `https://azure-api.net/aigateway/Data.All` scope.
 5. Allow the gateway, identity endpoints, and approved software sources through
    network controls, and approve script execution and application installation.
-6. Provide the **tenant ID**, **gateway Anthropic base URL**, and **full published
-   model aliases** to users, or supply them in a completed launch command.
+6. Provide the **tenant ID** and **gateway runtime URL** to users, or supply
+   them in a completed launch command. Developers do not enter model aliases,
+   shortcut mappings, subscription IDs, or gateway resource IDs.
 
 The scripts do not create Azure resources, deploy models, grant permissions, or
 bypass IT policies. This integration uses the dedicated public-Azure AI Gateway
@@ -81,7 +84,7 @@ If you saved the file elsewhere, adjust the path.
 For either script:
 
 1. Select `Desktop`, `CLI`, `VSCode`, or `All`. Press Enter for Desktop.
-2. Enter the tenant ID, gateway URL, and exact model aliases provided by IT.
+2. Enter the tenant ID and gateway URL provided by your administrator.
 3. Complete Microsoft sign-in/MFA if requested.
 4. Follow installation approvals, app-close instructions, and any Windows
    restart/rerun instructions.
@@ -94,10 +97,43 @@ to enter technical details. The parameters are:
 | Client | `-Client` | `--client` |
 | Tenant ID | `-TenantId` | `--tenant-id` |
 | Gateway URL | `-GatewayBaseUrl` | `--gateway-base-url` |
-| Full model aliases | `-Models` | `--models` |
 
-Both scripts accept a quoted comma-separated list of aliases. Use the complete
-published aliases, not an assumed model name.
+The previous `-Models` / `--models` arguments have been removed. The gateway is
+the source of truth for the model list.
+
+Copy the **Gateway runtime endpoint** from AI Gateway Home. Both scripts
+automatically append `/default/models/anthropic`. A full Anthropic base URL
+continues to work. No developer needs to construct the endpoint path.
+
+### Automatic model discovery
+
+After work-account sign-in, both scripts find the gateway from its runtime
+hostname using Azure Resource Graph. They read its published aliases, check the
+signed-in user's model-invocation permissions, and read backend model metadata.
+Only permitted Claude aliases supporting Anthropic Messages are configured;
+OpenAI, DeepSeek, embeddings, and other incompatible models are excluded.
+
+There is no customer gateway name, model alias, version, or model-count limit
+hardcoded in the scripts. A gateway exposing one, two, or three permitted Claude
+aliases produces exactly that list in Desktop, CLI, and VS Code. Custom callable
+aliases are preserved exactly. Claude Code shortcuts are mapped from the actual
+backend model family, not from guesses about the alias name. Missing families
+are not invented or redirected to a different family. The first discovered alias
+is the default; every discovered alias gets its own Claude Code picker entry,
+including multiple aliases from the same family. Built-in model rows are replaced;
+the client can still display its Default and current-model rows.
+
+Discovery uses read-only Azure management APIs and does not send inference
+requests or change gateway permissions. It requires catalog read access in
+addition to the runtime role. If discovery fails or no permitted Claude aliases
+are found, setup stops without guessing a model or writing client configuration.
+Azure Resource Graph and RBAC updates can take time to propagate.
+
+Rerun onboarding after changing published models or group access to refresh
+the local model list. Gateway authorization always remains the final authority;
+discovery does not prove that an inference request will pass network, quota, or
+other gateway/backend policies. Use `-VerifyModels` / `--verify-models` only when
+you intentionally want a small paid inference check for every discovered alias.
 
 ## What the setup does for you
 

@@ -18,7 +18,6 @@ param(
     [string]$Client,
     [Guid]$TenantId = [Guid]::Empty,
     [string]$GatewayBaseUrl,
-    [string[]]$Models,
     [switch]$VerifyModels
 )
 
@@ -45,33 +44,207 @@ function Resolve-OnboardingClients {
 function Resolve-OnboardingInputs {
     param(
         [Guid]$Tenant,
-        [string]$BaseUrl,
-        [string[]]$ModelNames
+        [string]$BaseUrl
     )
 
     if ($Tenant -eq [Guid]::Empty) {
         $Tenant = [Guid](Read-Host 'Enter the customer gateway Directory (tenant) ID')
     }
     if ([string]::IsNullOrWhiteSpace($BaseUrl)) {
-        $BaseUrl = Read-Host 'Enter the customer gateway Anthropic base URL'
-    }
-    if (-not $ModelNames.Count) {
-        $modelInput = Read-Host 'Enter the full customer model aliases, separated by commas'
-        $ModelNames = @($modelInput)
+        $BaseUrl = Read-Host 'Enter the gateway runtime URL from AI Gateway Home'
     }
     return [pscustomobject]@{
         TenantId = $Tenant
         GatewayBaseUrl = $BaseUrl.Trim()
-        Models = @(ConvertTo-ModelAliases -ModelNames $ModelNames)
     }
 }
 
-function ConvertTo-ModelAliases {
-    param([string[]]$ModelNames)
+function Resolve-GatewayBaseUrl {
+    param([string]$BaseUrl)
 
-    return @($ModelNames | ForEach-Object {
-        ([string]$_ -split ',') | ForEach-Object { $_.Trim() }
-    } | Select-Object -Unique)
+    $uri = [Uri]$BaseUrl.Trim()
+    if (-not $uri.IsAbsoluteUri -or $uri.Scheme -ne 'https' -or
+        $uri.Host -notmatch '^[a-z0-9.-]+\.ai\.gateway\.azure\.com$' -or
+        $uri.Port -ne 443 -or $uri.UserInfo -or $uri.Query -or $uri.Fragment -or
+        ($uri.AbsolutePath.TrimEnd('/') -and $uri.AbsolutePath.TrimEnd('/') -notlike '*/models/anthropic')) {
+        throw 'Use the dedicated AI Gateway HTTPS runtime URL or Anthropic base URL on port 443, with no credentials, query, or fragment.'
+    }
+    $resolved = $uri.AbsoluteUri.TrimEnd('/')
+    if (-not $uri.AbsolutePath.Trim('/')) { $resolved += '/default/models/anthropic' }
+    return $resolved
+}
+
+function Resolve-CodeModelMapping {
+    param([object[]]$Catalog)
+
+    $mapping = [ordered]@{}
+    foreach ($family in @('Opus', 'Sonnet', 'Haiku')) {
+        $pattern = '(?i)(^|[._-])' + $family + '($|[._-])'
+        $match = $Catalog | Where-Object { @($_.ModelNames | Where-Object { $_ -match $pattern }).Count } |
+            Select-Object -First 1
+        if ($match) {
+            $mapping[$family] = $match.Alias
+        }
+    }
+    return $mapping
+}
+
+function Invoke-GatewayCatalogRequest {
+    param([string]$Uri, [string]$Token, $Body)
+
+    $target = [Uri]$Uri
+    if ($target.Scheme -ne 'https' -or $target.Host -ne 'management.azure.com' -or
+        $target.Port -ne 443 -or $target.UserInfo -or $target.Fragment) {
+        throw 'The gateway catalog returned an invalid Azure management URL.'
+    }
+    $arguments = @{
+        Uri = $Uri; UseBasicParsing = $true; TimeoutSec = 30; MaximumRedirection = 0
+        Headers = @{ Authorization = "Bearer $Token" }
+        Method = 'Get'
+    }
+    if ($null -ne $Body) {
+        $arguments.Method = 'Post'
+        $arguments.ContentType = 'application/json'
+        $arguments.Body = $Body | ConvertTo-Json -Depth 20 -Compress
+    }
+    try {
+        $response = Invoke-WebRequest @arguments
+        $document = $response.Content | ConvertFrom-Json
+        if ($document -isnot [pscustomobject]) { throw 'The gateway catalog returned an invalid object.' }
+        return $document
+    }
+    catch {
+        throw ('Cannot read the AI Gateway catalog. Your account needs gateway catalog read access ' +
+            'as well as AI Gateway Models User permission. No models were guessed. ' + $_.Exception.Message)
+    }
+}
+
+function Get-GatewayCatalogItems {
+    param([string]$Uri, [string]$Token, [string]$Scope)
+
+    $seen = New-Object 'Collections.Generic.HashSet[string]'
+    while ($Uri) {
+        if (-not ([Uri]$Uri).AbsolutePath.StartsWith($Scope + '/', [StringComparison]::OrdinalIgnoreCase) -or
+            -not $seen.Add($Uri)) {
+            throw 'The gateway catalog returned an invalid or repeated pagination URL.'
+        }
+        $page = Invoke-GatewayCatalogRequest -Uri $Uri -Token $Token
+        if ($null -eq $page.value -or $page.value -isnot [Array] -or
+            @($page.value | Where-Object { $_ -isnot [pscustomobject] }).Count) {
+            throw 'The gateway catalog returned an invalid list response.'
+        }
+        $page.value
+        $Uri = $page.nextLink
+    }
+}
+
+function Test-GatewayModelInvocation {
+    param([object[]]$Permissions)
+
+    foreach ($permission in $Permissions) {
+        if ($permission -isnot [pscustomobject]) { throw 'The gateway returned invalid model permissions.' }
+        foreach ($field in @('dataActions', 'notDataActions')) {
+            $value = $permission.$field
+            if ($null -ne $value -and ($value -isnot [Array] -or
+                @($value | Where-Object { $_ -isnot [string] }).Count)) {
+                throw 'The gateway returned invalid model permissions.'
+            }
+        }
+        foreach ($action in @(
+            'Microsoft.ApiManagement/service/workspaces/models/invoke/action',
+            'Microsoft.ApiManagement/aigateways/models/invoke/action'
+        )) {
+            $allowed = @($permission.dataActions | Where-Object { $action -like $_ }).Count -gt 0
+            $excluded = @($permission.notDataActions | Where-Object { $action -like $_ }).Count -gt 0
+            if ($allowed -and -not $excluded) { return $true }
+        }
+    }
+    return $false
+}
+
+function Get-GatewayModelCatalog {
+    param($Settings)
+
+    $result = Invoke-NativeCapture -FilePath $Settings.AzureCliPath -Arguments @(
+        'account', 'get-access-token', '--tenant', $Settings.TenantId,
+        '--resource', 'https://management.azure.com', '--query', 'accessToken',
+        '--output', 'tsv', '--only-show-errors'
+    )
+    if ($result.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($result.Output)) {
+        throw 'Cannot acquire an Azure management token for automatic model discovery. Check sign-in and gateway catalog read access.'
+    }
+    $token = $result.Output
+    $endpoint = [Uri]$Settings.GatewayBaseUrl
+    $hostUrl = $endpoint.GetLeftPart([UriPartial]::Authority)
+    $query = "Resources | where type in~ ('microsoft.apimanagement/aigateways', 'microsoft.apimanagement/service')" +
+        " | where tostring(properties.gatewayUrl) =~ '$hostUrl' or tostring(properties.frontend.defaultHostname) =~ '$($endpoint.Host)'" +
+        ' | project id'
+    $lookup = Invoke-GatewayCatalogRequest -Token $token `
+        -Uri 'https://management.azure.com/providers/Microsoft.ResourceGraph/resources?api-version=2022-10-01' `
+        -Body @{ query = $query; options = @{ resultFormat = 'objectArray'; allowPartialScopes = $true; '$top' = 2 } }
+    if (@($lookup.data).Count -ne 1 -or -not $lookup.data[0].id) {
+        throw 'Cannot uniquely find this gateway from its URL. Check the URL and gateway read access, or allow time for Azure Resource Graph indexing.'
+    }
+    $root = [string]$lookup.data[0].id
+    if ($root -notmatch '^/subscriptions/[0-9a-f-]{36}/resourceGroups/[^/?#]+/providers/Microsoft\.ApiManagement/(aigateways|service)/[^/?#]+$') {
+        throw 'Discovery returned an invalid gateway resource ID.'
+    }
+    $version = '2025-09-01-preview'
+    $gateway = Invoke-GatewayCatalogRequest -Token $token -Uri "https://management.azure.com${root}?api-version=$version"
+    if (([string]$gateway.properties.gatewayUrl).TrimEnd('/') -ne $hostUrl -and
+        $gateway.properties.frontend.defaultHostname -ne $endpoint.Host) {
+        throw 'The current gateway hostname does not match the supplied URL. Azure Resource Graph might still be indexing a change.'
+    }
+    $workspace = $endpoint.AbsolutePath.TrimEnd('/').Split('/')[-3]
+    $scope = "$root/workspaces/$workspace"
+    $aliases = @(Get-GatewayCatalogItems -Token $token -Scope $scope `
+        -Uri "https://management.azure.com$scope/aliases?api-version=$version")
+    $seenAliases = New-Object 'Collections.Generic.HashSet[string]'
+    $models = @{}
+    $catalog = @()
+    foreach ($entry in $aliases) {
+        if ($entry.properties -isnot [pscustomobject] -or $entry.properties.supportedEndpoints -isnot [Array] -or
+            @($entry.properties.supportedEndpoints | Where-Object { $_ -isnot [string] }).Count) {
+            throw 'The gateway returned invalid alias endpoint metadata.'
+        }
+        if (@($entry.properties.supportedEndpoints) -cnotcontains '/anthropic/v1/messages') { continue }
+        $alias = [string]$entry.properties.aliasName
+        if ($alias -cnotmatch '^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*$' -or
+            -not $seenAliases.Add($alias) -or
+            -not ([string]$entry.id).StartsWith("$scope/aliases/", [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'The gateway returned an invalid or duplicate callable alias.'
+        }
+        $permissions = @(Get-GatewayCatalogItems -Token $token -Scope $scope `
+            -Uri "https://management.azure.com$($entry.id)/providers/Microsoft.Authorization/permissions?api-version=2022-04-01")
+        if (-not (Test-GatewayModelInvocation -Permissions $permissions)) { continue }
+        $names = @()
+        if ($entry.properties.backendModels -isnot [Array] -or -not $entry.properties.backendModels.Count) {
+            throw 'A published gateway alias has no valid backend model list.'
+        }
+        foreach ($backend in @($entry.properties.backendModels)) {
+            $id = [string]$backend.resourceId
+            if (-not $id.StartsWith("$scope/modelProviders/", [StringComparison]::OrdinalIgnoreCase) -or
+                $id.Substring($scope.Length) -notmatch '^/modelProviders/[^/?#]+/models/[^/?#]+$') {
+                throw 'The gateway alias contains an invalid backend model reference.'
+            }
+            if (-not $models.ContainsKey($id)) {
+                $model = Invoke-GatewayCatalogRequest -Token $token -Uri "https://management.azure.com${id}?api-version=$version"
+                if ($model.properties.deployment.modelName -isnot [string] -or
+                    [string]::IsNullOrWhiteSpace($model.properties.deployment.modelName)) {
+                    throw 'A gateway backend is missing its model identity; discovery cannot safely classify it.'
+                }
+                $models[$id] = [string]$model.properties.deployment.modelName
+            }
+            $names += $models[$id]
+        }
+        if (-not $names.Count) { throw 'A published gateway alias has no backend model.' }
+        if (@($names | Where-Object { $_ -notmatch '(?i)^claude([._-]|$)' }).Count) { continue }
+        $catalog += [pscustomobject]@{ Alias = $alias; ModelNames = $names }
+    }
+    if (-not $catalog.Count) {
+        throw 'No permitted Claude models were found. Check published Anthropic aliases and your AI Gateway Models User assignments.'
+    }
+    return $catalog
 }
 
 function Invoke-NativeCapture {
@@ -716,13 +889,16 @@ function Backup-SettingsFile {
 function Get-CodeGatewayEnvironment {
     param($Settings)
 
-    return [ordered]@{
+    $environment = [ordered]@{
         ANTHROPIC_BASE_URL = $Settings.GatewayBaseUrl
-        ANTHROPIC_DEFAULT_OPUS_MODEL = $Settings.Models[0]
-        ANTHROPIC_DEFAULT_SONNET_MODEL = $Settings.Models[0]
-        ANTHROPIC_DEFAULT_HAIKU_MODEL = $Settings.Models[0]
         CLAUDE_CODE_API_KEY_HELPER_TTL_MS = '180000'
     }
+    foreach ($family in @('Opus', 'Sonnet', 'Haiku')) {
+        if ($Settings.ModelMapping.$family) {
+            $environment["ANTHROPIC_DEFAULT_$($family.ToUpperInvariant())_MODEL"] = $Settings.ModelMapping.$family
+        }
+    }
+    return $environment
 }
 
 function Test-CodeProviderEnabled {
@@ -791,6 +967,9 @@ function Install-CodeConfiguration {
     if (-not $config.PSObject.Properties['env']) {
         $config | Add-Member -NotePropertyName env -NotePropertyValue ([pscustomobject]@{})
     }
+    foreach ($family in @('OPUS', 'SONNET', 'HAIKU')) {
+        $config.env.PSObject.Properties.Remove("ANTHROPIC_DEFAULT_${family}_MODEL")
+    }
     foreach ($entry in (Get-CodeGatewayEnvironment -Settings $Settings).GetEnumerator()) {
         $config.env | Add-Member -NotePropertyName $entry.Key -NotePropertyValue $entry.Value -Force
     }
@@ -801,6 +980,11 @@ function Install-CodeConfiguration {
     $config | Add-Member -NotePropertyName apiKeyHelper -NotePropertyValue ('"' + $HelperPath + '"') -Force
     $config | Add-Member -NotePropertyName model -NotePropertyValue $Settings.Models[0] -Force
     $config | Add-Member -NotePropertyName availableModels -NotePropertyValue @($Settings.Models) -Force
+    $config | Add-Member -NotePropertyName enforceAvailableModels -NotePropertyValue $true -Force
+    $config | Add-Member -NotePropertyName modelPicker -NotePropertyValue ([pscustomobject]@{
+        replaceBuiltInOptions = $true
+        options = @($Settings.Models | ForEach-Object { [pscustomobject]@{ model = $_; label = $_ } })
+    }) -Force
     [IO.Directory]::CreateDirectory($directory) | Out-Null
     Backup-SettingsFile -Path $path -InstallRoot $InstallRoot
     Write-JsonFile -Path $path -Value $config
@@ -826,7 +1010,9 @@ function Install-VSCodeConfiguration {
     }
     Assert-CodeSettingsCompatible -Settings ([pscustomobject]@{ env = $environment }) -Source $path
     $gatewayEnvironment = Get-CodeGatewayEnvironment -Settings $Settings
-    $variables = @($variables | Where-Object { $_.name -ne 'ANTHROPIC_MODEL' -and -not $gatewayEnvironment.Contains($_.name) })
+    $owned = @('ANTHROPIC_MODEL', 'ANTHROPIC_DEFAULT_OPUS_MODEL',
+        'ANTHROPIC_DEFAULT_SONNET_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL')
+    $variables = @($variables | Where-Object { $_.name -notin $owned -and -not $gatewayEnvironment.Contains($_.name) })
     $variables += @($gatewayEnvironment.GetEnumerator() | ForEach-Object {
         [pscustomobject]@{ name = $_.Key; value = $_.Value }
     })
@@ -888,7 +1074,6 @@ function Start-DeveloperOnboarding {
     param(
         [Guid]$Tenant,
         [string]$BaseUrl,
-        [string[]]$ModelNames,
         [string]$SourceScript,
         [string[]]$Clients = @('Desktop'),
         [switch]$VerifyModels
@@ -913,18 +1098,7 @@ function Start-DeveloperOnboarding {
         throw 'Select Desktop, CLI, VSCode, or All through the client selection.'
     }
 
-    $uri = [Uri]$BaseUrl.Trim()
-    if (-not $uri.IsAbsoluteUri -or $uri.Scheme -ne 'https' -or
-        -not $uri.Host.EndsWith('.ai.gateway.azure.com', [StringComparison]::OrdinalIgnoreCase) -or
-        $uri.Port -ne 443 -or $uri.UserInfo -or $uri.Query -or $uri.Fragment -or
-        $uri.AbsolutePath.TrimEnd('/') -notlike '*/models/anthropic') {
-        throw 'Use the dedicated AI Gateway HTTPS Anthropic base URL on port 443, with no credentials, query, or fragment.'
-    }
-    $BaseUrl = $uri.AbsoluteUri.TrimEnd('/')
-    $ModelNames = @(ConvertTo-ModelAliases -ModelNames $ModelNames)
-    if (-not $ModelNames.Count -or @($ModelNames | Where-Object { $_ -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' }).Count) {
-        throw 'Provide full provider/model aliases, not display names.'
-    }
+    $BaseUrl = Resolve-GatewayBaseUrl -BaseUrl $BaseUrl
     $useDesktop = $Clients -contains 'Desktop'
     $useCLI = $Clients -contains 'CLI'
     $useVSCode = $Clients -contains 'VSCode'
@@ -934,15 +1108,6 @@ function Start-DeveloperOnboarding {
     }
     if ($useCode) {
         Assert-NoManagedCodePolicy
-        foreach ($scope in @('Process', 'User', 'Machine')) {
-            $modelOverride = [Environment]::GetEnvironmentVariable('ANTHROPIC_MODEL', $scope)
-            if ($modelOverride) {
-                if ($modelOverride -cnotin $ModelNames) {
-                    throw "Conflicting ANTHROPIC_MODEL in the $scope environment. Resolve it before onboarding; it overrides the supplied gateway aliases."
-                }
-                Write-Host "ANTHROPIC_MODEL in the $scope environment overrides the saved default. Clear that model pin if you want /model choices to persist."
-            }
-        }
         $codeSettingsPath = Join-Path $env:USERPROFILE '.claude\settings.json'
         Assert-CodeSettingsCompatible -Settings (Read-JsonSettings -Path $codeSettingsPath) -Source $codeSettingsPath
     }
@@ -993,6 +1158,43 @@ function Start-DeveloperOnboarding {
     }
     Write-Host 'Checking and installing developer prerequisites...'
     $azureCli = Ensure-AzureCli -Architecture $architecture -WindowsBuild ([int]$os.BuildNumber)
+    $settings = [pscustomobject]@{
+        TenantId = $Tenant.ToString()
+        GatewayBaseUrl = $BaseUrl.TrimEnd('/')
+        Models = @()
+        ModelMapping = $null
+        AzureCliPath = $azureCli
+        ConfigId = $configId
+    }
+    Write-Host 'Checking your Entra sign-in. Complete Microsoft sign-in if prompted.'
+    $credential = Get-EntraCredential -Settings $settings -Context interactive
+    Write-Host 'Discovering your permitted Claude models from AI Gateway...'
+    $catalog = @(Get-GatewayModelCatalog -Settings $settings)
+    $settings.Models = @($catalog | ForEach-Object { $_.Alias })
+    $settings.ModelMapping = Resolve-CodeModelMapping -Catalog $catalog
+    Write-Host ('Discovered models: ' + ($settings.Models -join ', '))
+    if ($useCode) {
+        foreach ($scope in @('Process', 'User', 'Machine')) {
+            foreach ($name in @('ANTHROPIC_MODEL', 'ANTHROPIC_DEFAULT_OPUS_MODEL',
+                'ANTHROPIC_DEFAULT_SONNET_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL')) {
+                $modelOverride = [Environment]::GetEnvironmentVariable($name, $scope)
+                if ($modelOverride) {
+                    if ($modelOverride -cnotin $settings.Models) {
+                        throw "Conflicting $name in the $scope environment. It is not in your discovered gateway model list."
+                    }
+                    if ($name -eq 'ANTHROPIC_MODEL') {
+                        Write-Host "ANTHROPIC_MODEL in the $scope environment overrides the saved default. Clear that model pin if you want /model choices to persist."
+                    }
+                }
+            }
+        }
+    }
+    if ($VerifyModels) {
+        Test-GatewayModels -Settings $settings -Token $credential.token
+    } else {
+        Write-Host 'Published models and RBAC were checked without inference. Backend inference and quotas remain unverified; use -VerifyModels for one small request per model.'
+    }
+    $credential = $null
     $workspace = [pscustomobject]@{ RestartNeeded = $false }
     if ($useDesktop) {
         $package = Ensure-ClaudeDesktop -Architecture $architecture
@@ -1014,21 +1216,6 @@ function Start-DeveloperOnboarding {
         $codePath = Ensure-CodeClient -Name code -Architecture $architecture
         Ensure-ClaudeCodeExtension -CodePath $codePath
     }
-    $settings = [pscustomobject]@{
-        TenantId = $Tenant.ToString()
-        GatewayBaseUrl = $BaseUrl.TrimEnd('/')
-        Models = @($ModelNames | Select-Object -Unique)
-        AzureCliPath = $azureCli
-        ConfigId = $configId
-    }
-    Write-Host 'Checking your Entra sign-in. Complete Microsoft sign-in if prompted.'
-    $credential = Get-EntraCredential -Settings $settings -Context interactive
-    if ($VerifyModels) {
-        Test-GatewayModels -Settings $settings -Token $credential.token
-    } else {
-        Write-Host 'Paid model tests skipped. Model access, aliases, and gateway policies are not verified; use -VerifyModels for one small request per alias.'
-    }
-    $credential = $null
     if ($useDesktop) {
         Wait-ForClaudeToClose -Package $package
     }
@@ -1111,15 +1298,15 @@ try {
         exit 0
     }
     $clients = @(Resolve-OnboardingClients -Selection $Client)
-    $inputs = Resolve-OnboardingInputs -Tenant $TenantId -BaseUrl $GatewayBaseUrl -ModelNames $Models
+    $inputs = Resolve-OnboardingInputs -Tenant $TenantId -BaseUrl $GatewayBaseUrl
     $exitCode = Start-DeveloperOnboarding -Tenant $inputs.TenantId -BaseUrl $inputs.GatewayBaseUrl `
-        -ModelNames $inputs.Models -SourceScript $PSCommandPath -Clients $clients -VerifyModels:$VerifyModels
+        -SourceScript $PSCommandPath -Clients $clients -VerifyModels:$VerifyModels
     exit $exitCode
 }
 catch {
     [Console]::Error.WriteLine(('Claude gateway ' + $(if ($Credential -or $CodeCredential) { 'credential helper' } else { 'onboarding' }) + ' failed: ' + $_.Exception.Message))
     if ($CodeCredential) {
-        [Console]::Error.WriteLine('If your Entra sign-in expired, rerun onboarding with your client, tenant, gateway URL, and aliases to sign in again.')
+        [Console]::Error.WriteLine('If your Entra sign-in expired, rerun onboarding with your client, tenant, and gateway URL to sign in again.')
     }
     exit 1
 }

@@ -7,11 +7,12 @@ if [[ "${1-}" == "--help" || "${1-}" == "-h" ]]; then
 Usage: bash onboard-claude-gateway-macos.sh [options]
   --client Desktop|CLI|VSCode|All       Default: prompt (Enter selects Desktop)
   --tenant-id UUID                     Customer gateway Entra tenant
-  --gateway-base-url HTTPS_URL         Dedicated Azure AI Gateway Anthropic URL
-  --models provider/alias[,alias...]   Full aliases; spaces between aliases also work
+  --gateway-base-url HTTPS_URL         AI Gateway runtime URL or Anthropic base URL
   --verify-models                      Opt in to one small paid request per alias
 
 Requires macOS 14+, Apple silicon or Intel, and Python 3.11+.
+Claude models are discovered from the gateway using your signed-in identity.
+Gateway catalog read access and AI Gateway Models User permission are required.
 Missing software uses existing IT-approved Homebrew; Homebrew is never installed.
 Run in Terminal as the intended user, not with sudo or inside VS Code.
 Normal setup makes no model inference requests unless --verify-models is supplied.
@@ -73,6 +74,7 @@ import argparse
 import base64
 import contextlib
 import ctypes
+import fnmatch
 import hashlib
 import json
 import math
@@ -312,32 +314,187 @@ class Paths:
         self.system_library = system_library
 
 
-def normalize_inputs(tenant, base_url, models):
+def normalize_inputs(tenant, base_url, models=None):
     try:
         tenant = str(uuid.UUID(tenant.strip()))
     except (ValueError, AttributeError) as error:
         raise SetupError("Provide a valid customer gateway tenant UUID.") from error
     if tenant == str(uuid.UUID(int=0)):
         raise SetupError("The tenant UUID must not be empty.")
-    if not isinstance(models, (list, tuple)) or any(not isinstance(item, str) for item in models):
+    if models is not None and (not isinstance(models, (list, tuple)) or any(not isinstance(item, str) for item in models)):
         raise SetupError("Models must be a list of full provider/model alias strings.")
     try:
         if any(character.isspace() or ord(character) < 32 or ord(character) == 127 for character in base_url.strip()):
             raise ValueError()
         url = urllib.parse.urlsplit(base_url.strip())
         if (url.scheme != "https" or not url.hostname or
-                not url.hostname.endswith(".ai.gateway.azure.com") or
+                not re.fullmatch(r"[a-z0-9.-]+\.ai\.gateway\.azure\.com", url.hostname) or
                 url.port not in (None, 443) or url.username is not None or
                 url.password is not None or url.query or url.fragment or
-                not url.path.rstrip("/").endswith("/models/anthropic")):
+                (url.path.rstrip("/") and not url.path.rstrip("/").endswith("/models/anthropic"))):
             raise ValueError()
-        base_url = urllib.parse.urlunsplit(("https", url.hostname, url.path.rstrip("/"), "", ""))
+        path = url.path.rstrip("/") or "/default/models/anthropic"
+        base_url = urllib.parse.urlunsplit(("https", url.hostname, path, "", ""))
     except (ValueError, AttributeError) as error:
-        raise SetupError("Use the dedicated AI Gateway HTTPS Anthropic URL on port 443, without credentials, query, or fragment.") from error
-    aliases = list(dict.fromkeys(alias.strip() for item in models for alias in item.split(",")))
-    if not aliases or any(not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", alias) for alias in aliases):
-        raise SetupError("Provide full provider/model aliases, not display names or empty entries.")
+        raise SetupError("Use the dedicated AI Gateway HTTPS runtime URL or Anthropic base URL on port 443, without credentials, query, or fragment.") from error
+    aliases = [] if models is None else list(dict.fromkeys(models))
+    if models is not None and (not aliases or any(
+            not re.fullmatch(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*", alias) for alias in aliases)):
+        raise SetupError("Saved gateway model aliases are invalid. Rerun onboarding to rediscover them.")
     return tenant, base_url, aliases
+
+
+def resolve_code_model_mapping(catalog):
+    mapping = {}
+    for family in ("Opus", "Sonnet", "Haiku"):
+        pattern = re.compile(r"(^|[._-])" + family + r"($|[._-])", re.I)
+        match = next((item for item in catalog if any(pattern.search(name) for name in item["ModelNames"])), None)
+        if match:
+            mapping[family] = match["Alias"]
+    return mapping
+
+
+def catalog_request(url, token, body=None):
+    target = urllib.parse.urlsplit(url)
+    if (target.scheme != "https" or target.hostname != "management.azure.com" or
+            target.port not in (None, 443) or target.username or target.password or target.fragment):
+        raise SetupError("The gateway catalog returned an invalid Azure management URL.")
+    request = urllib.request.Request(
+        url, data=None if body is None else json_bytes(body),
+        headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"},
+        method="GET" if body is None else "POST",
+    )
+    try:
+        with urllib.request.build_opener(NoRedirect()).open(request, timeout=30) as response:
+            data = response.read(4 * 1024 * 1024 + 1)
+            if len(data) > 4 * 1024 * 1024:
+                raise SetupError("The gateway catalog response exceeds the supported size.")
+            value = json.loads(data)
+            if not isinstance(value, dict):
+                raise SetupError("The gateway catalog returned an invalid object.")
+            return value
+    except urllib.error.HTTPError as error:
+        raise SetupError(f"Cannot read the AI Gateway catalog (HTTP {error.code}). Your account needs gateway "
+                         "catalog read access as well as AI Gateway Models User permission. No models were guessed.") from error
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, UnicodeError) as error:
+        raise SetupError("Cannot read the AI Gateway catalog. Check connectivity and trusted certificates; no models were guessed.") from error
+
+
+def catalog_items(url, token, scope):
+    seen = set()
+    while url:
+        if (not isinstance(url, str) or
+                not urllib.parse.urlsplit(url).path.lower().startswith(scope.lower() + "/") or url in seen):
+            raise SetupError("The gateway catalog returned an invalid or repeated pagination URL.")
+        seen.add(url)
+        page = catalog_request(url, token)
+        if (not isinstance(page.get("value"), list) or
+                any(not isinstance(item, dict) for item in page["value"])):
+            raise SetupError("The gateway catalog returned an invalid list response.")
+        yield from page["value"]
+        url = page.get("nextLink")
+
+
+def can_invoke_model(permissions):
+    for permission in permissions:
+        if not isinstance(permission, dict):
+            raise SetupError("The gateway returned invalid model permissions.")
+        for field in ("dataActions", "notDataActions"):
+            value = permission.get(field, [])
+            if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+                raise SetupError("The gateway returned invalid model permissions.")
+        for action in ("Microsoft.ApiManagement/service/workspaces/models/invoke/action",
+                       "Microsoft.ApiManagement/aigateways/models/invoke/action"):
+            allowed = any(fnmatch.fnmatchcase(action.lower(), pattern.lower()) for pattern in permission.get("dataActions", []))
+            excluded = any(fnmatch.fnmatchcase(action.lower(), pattern.lower()) for pattern in permission.get("notDataActions", []))
+            if allowed and not excluded:
+                return True
+    return False
+
+
+def discover_models(settings):
+    environment = dict(os.environ)
+    if settings.get("AzureConfigDir"):
+        environment["AZURE_CONFIG_DIR"] = settings["AzureConfigDir"]
+    result = run([settings["AzureCliPath"], "account", "get-access-token", "--tenant", settings["TenantId"],
+                  "--resource", "https://management.azure.com", "--query", "accessToken",
+                  "--output", "tsv", "--only-show-errors"], timeout=45, environment=environment)
+    if result.returncode or not result.stdout.strip():
+        raise SetupError("Cannot acquire an Azure management token for automatic model discovery. Check sign-in and gateway catalog read access.")
+    token = result.stdout.strip()
+    endpoint = urllib.parse.urlsplit(settings["GatewayBaseUrl"])
+    origin = urllib.parse.urlunsplit(("https", endpoint.hostname, "", "", ""))
+    query = ("Resources | where type in~ ('microsoft.apimanagement/aigateways', 'microsoft.apimanagement/service')" +
+             f" | where tostring(properties.gatewayUrl) =~ '{origin}' or tostring(properties.frontend.defaultHostname) =~ '{endpoint.hostname}'" +
+             " | project id")
+    lookup = catalog_request(
+        "https://management.azure.com/providers/Microsoft.ResourceGraph/resources?api-version=2022-10-01", token,
+        {"query": query, "options": {"resultFormat": "objectArray", "allowPartialScopes": True, "$top": 2}},
+    )
+    matches = lookup.get("data")
+    if not isinstance(matches, list) or len(matches) != 1 or not isinstance(matches[0], dict):
+        raise SetupError("Cannot uniquely find this gateway from its URL. Check the URL and gateway read access, or allow time for Azure Resource Graph indexing.")
+    root = matches[0].get("id", "")
+    if not isinstance(root, str) or not re.fullmatch(
+            r"/subscriptions/[0-9a-f-]{36}/resourceGroups/[^/?#]+/providers/Microsoft\.ApiManagement/(aigateways|service)/[^/?#]+",
+            root, re.I):
+        raise SetupError("Discovery returned an invalid gateway resource ID.")
+    version = "2025-09-01-preview"
+    gateway = catalog_request(f"https://management.azure.com{root}?api-version={version}", token).get("properties")
+    if not isinstance(gateway, dict) or not isinstance(gateway.get("frontend", {}), dict):
+        raise SetupError("The gateway returned invalid hostname metadata.")
+    if (str(gateway.get("gatewayUrl", "")).rstrip("/").lower() != origin.lower() and
+            str(gateway.get("frontend", {}).get("defaultHostname", "")).lower() != endpoint.hostname):
+        raise SetupError("The current gateway hostname does not match the supplied URL. Azure Resource Graph might still be indexing a change.")
+    workspace = endpoint.path.rstrip("/").split("/")[-3]
+    scope = root + "/workspaces/" + workspace
+    catalog, models, seen_aliases = [], {}, set()
+    for entry in catalog_items(f"https://management.azure.com{scope}/aliases?api-version={version}", token, scope):
+        properties = entry.get("properties")
+        if (not isinstance(properties, dict) or not isinstance(properties.get("supportedEndpoints"), list) or
+                any(not isinstance(item, str) for item in properties["supportedEndpoints"])):
+            raise SetupError("The gateway returned invalid alias endpoint metadata.")
+        if "/anthropic/v1/messages" not in properties["supportedEndpoints"]:
+            continue
+        alias = properties.get("aliasName", "")
+        entry_id = entry.get("id", "")
+        if (not isinstance(alias, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*", alias) or
+                alias in seen_aliases or not isinstance(entry_id, str) or
+                not entry_id.lower().startswith(scope.lower() + "/aliases/")):
+            raise SetupError("The gateway returned an invalid or duplicate callable alias.")
+        seen_aliases.add(alias)
+        permissions = catalog_items(
+            f"https://management.azure.com{entry_id}/providers/Microsoft.Authorization/permissions?api-version=2022-04-01", token, scope)
+        if not can_invoke_model(permissions):
+            continue
+        names = []
+        backends = properties.get("backendModels")
+        if not isinstance(backends, list) or not backends:
+            raise SetupError("A published gateway alias has no valid backend model list.")
+        for backend in backends:
+            if not isinstance(backend, dict):
+                raise SetupError("The gateway alias contains an invalid backend model reference.")
+            resource_id = backend.get("resourceId", "")
+            if (not isinstance(resource_id, str) or
+                    not resource_id.lower().startswith(scope.lower() + "/modelproviders/") or
+                    not re.fullmatch(r"/modelProviders/[^/?#]+/models/[^/?#]+", resource_id[len(scope):], re.I)):
+                raise SetupError("The gateway alias contains an invalid backend model reference.")
+            if resource_id not in models:
+                model = catalog_request(f"https://management.azure.com{resource_id}?api-version={version}", token)
+                metadata = model.get("properties")
+                deployment = metadata.get("deployment") if isinstance(metadata, dict) else None
+                name = deployment.get("modelName") if isinstance(deployment, dict) else None
+                if not isinstance(name, str) or not name.strip():
+                    raise SetupError("A gateway backend is missing its model identity; discovery cannot safely classify it.")
+                models[resource_id] = name
+            names.append(models[resource_id])
+        if not names:
+            raise SetupError("A published gateway alias has no backend model.")
+        if all(re.match(r"^claude([._-]|$)", name, re.I) for name in names):
+            catalog.append({"Alias": alias, "ModelNames": names})
+    if not catalog:
+        raise SetupError("No permitted Claude models were found. Check published Anthropic aliases and your AI Gateway Models User assignments.")
+    return catalog
 
 
 def forced_preferences(domain, candidates):
@@ -427,6 +584,7 @@ def check_managed(paths, clients):
             raise SetupError("Managed Claude Code settings must be updated by IT.")
         keys = managed_keys(paths, "com.anthropic.claudecode", {
             "permissions", "env", "apiKeyHelper", "model", "availableModels",
+            "enforceAvailableModels", "modelPicker",
             "forceLoginMethod", "forceLoginOrgUUID", "policyHelper", "enabledPlugins",
         })
         if keys:
@@ -444,11 +602,14 @@ def check_environment(environment, source, aliases):
     headers = environment.get("ANTHROPIC_CUSTOM_HEADERS", "")
     if not isinstance(headers, str) or HEADER.search(headers):
         raise SetupError(f"Credential headers conflict with the Entra helper: {source}")
-    override = environment.get("ANTHROPIC_MODEL")
-    if source == "process environment" and override:
-        if override not in aliases:
-            raise SetupError("Conflicting ANTHROPIC_MODEL in the process environment.")
-        log("An inherited ANTHROPIC_MODEL overrides the saved default and later saved /model choices.")
+    if source == "process environment":
+        for name in ("ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL",
+                     "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL"):
+            override = environment.get(name)
+            if override and override not in aliases:
+                raise SetupError(f"Conflicting {name} in the process environment. It is not in your discovered gateway model list.")
+        if environment.get("ANTHROPIC_MODEL"):
+            log("An inherited ANTHROPIC_MODEL overrides the saved default and later saved /model choices.")
 
 
 def desktop_meta(path):
@@ -545,21 +706,27 @@ def build_plan(paths, settings, source, python_path, clients):
         environment = config.setdefault("env", {})
         check_environment(environment, str(paths.code), aliases)
         environment.pop("ANTHROPIC_MODEL", None)
+        model_keys = {f"ANTHROPIC_DEFAULT_{family}_MODEL" for family in ("OPUS", "SONNET", "HAIKU")}
+        for key in model_keys:
+            environment.pop(key, None)
         gateway = {
             "ANTHROPIC_BASE_URL": settings["GatewayBaseUrl"],
             "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": "180000",
-            "ANTHROPIC_DEFAULT_OPUS_MODEL": aliases[0],
-            "ANTHROPIC_DEFAULT_SONNET_MODEL": aliases[0],
-            "ANTHROPIC_DEFAULT_HAIKU_MODEL": aliases[0],
         }
+        gateway.update({f"ANTHROPIC_DEFAULT_{family.upper()}_MODEL": alias
+                        for family, alias in settings["ModelMapping"].items()})
         environment.update(gateway)
-        config.update(apiKeyHelper=shlex.quote(str(code_helper)), model=aliases[0], availableModels=aliases)
+        config.update(apiKeyHelper=shlex.quote(str(code_helper)), model=aliases[0],
+                      availableModels=aliases, enforceAvailableModels=True,
+                      modelPicker={"replaceBuiltInOptions": True,
+                                   "options": [{"model": alias, "label": alias} for alias in aliases]})
         plan[paths.code] = (json_bytes(config), (file_state(paths.code) or (None, 0o600))[1])
         if "VSCode" in clients:
             editor = read_json(paths.vscode)
             variables = vscode_environment(editor)
             check_environment({item["name"]: item["value"] for item in variables}, str(paths.vscode), aliases)
-            variables = [item for item in variables if item["name"] not in gateway and item["name"] != "ANTHROPIC_MODEL"]
+            variables = [item for item in variables if item["name"] not in gateway and
+                         item["name"] not in model_keys and item["name"] != "ANTHROPIC_MODEL"]
             variables.extend({"name": key, "value": value} for key, value in gateway.items())
             editor["claudeCode.environmentVariables"] = variables
             editor["claudeCode.disableLoginPrompt"] = True
@@ -806,7 +973,7 @@ def prompt(message):
             log(message)
             value = terminal.readline()
     except OSError as error:
-        raise SetupError("No interactive terminal is available. Supply --client, --tenant-id, --gateway-base-url and --models.") from error
+        raise SetupError("No interactive terminal is available. Supply --client, --tenant-id and --gateway-base-url.") from error
     if not value:
         raise SetupError("Input ended before configuration was supplied.")
     return value.strip()
@@ -819,10 +986,9 @@ def onboard(options, source, paths):
         raise SetupError("Choose Desktop, CLI, VSCode, or All.")
     selection = choices[selection.lower()]
     clients = {"Desktop", "CLI", "VSCode"} if selection == "All" else {selection}
-    tenant, base_url, aliases = normalize_inputs(
+    tenant, base_url, _ = normalize_inputs(
         options.tenant_id or prompt("Enter the customer gateway Directory (tenant) ID:"),
-        options.gateway_base_url or prompt("Enter the customer Anthropic gateway base URL:"),
-        options.models or [prompt("Enter full provider/model aliases, separated by commas:")],
+        options.gateway_base_url or prompt("Enter the gateway runtime URL from AI Gateway Home:"),
     )
     if "VSCode" in clients and os.environ.get("TERM_PROGRAM") == "vscode":
         raise SetupError("Run in a separate Terminal window, not inside VS Code; selected apps must be closed.")
@@ -830,20 +996,26 @@ def onboard(options, source, paths):
     if not os.path.isabs(python_path):
         raise SetupError("The helper Python interpreter path must be absolute.")
     cache = Path(os.environ.get("AZURE_CONFIG_DIR") or str(paths.home / ".azure")).expanduser().absolute()
-    settings = {"TenantId": tenant, "GatewayBaseUrl": base_url, "Models": aliases,
+    settings = {"TenantId": tenant, "GatewayBaseUrl": base_url, "Models": [], "ModelMapping": {},
                 "AzureCliPath": "", "AzureConfigDir": str(cache)}
     with onboarding_lock(paths.root):
         check_managed(paths, clients)
-        build_plan(paths, settings, source, python_path, clients)
         wait_for_clients(clients)
-        tools = ensure_tools(paths, clients)
+        tools = ensure_tools(paths, set())
         settings["AzureCliPath"] = str(tools["azure"])
         token = get_token(settings, interactive=True)
+        log("Discovering your permitted Claude models from AI Gateway...")
+        catalog = discover_models(settings)
+        settings["Models"] = [item["Alias"] for item in catalog]
+        settings["ModelMapping"] = resolve_code_model_mapping(catalog)
+        log("Discovered models: " + ", ".join(settings["Models"]))
+        build_plan(paths, settings, source, python_path, clients)
         if options.verify_models:
             verify_models(settings, token)
         else:
-            log("Paid model tests skipped. Aliases, RBAC and inference access are unverified; use --verify-models for an intentional paid check.")
+            log("Published models and RBAC were checked without inference. Backend inference and quotas remain unverified; use --verify-models for one small request per model.")
         token = None
+        tools = ensure_tools(paths, clients)
         wait_for_clients(clients)
         check_managed(paths, clients)
         root, settings, plan = build_plan(paths, settings, source, python_path, clients)
@@ -868,7 +1040,6 @@ def main(arguments, source):
     parser.add_argument("--client", choices=("Desktop", "CLI", "VSCode", "All"))
     parser.add_argument("--tenant-id")
     parser.add_argument("--gateway-base-url")
-    parser.add_argument("--models", nargs="+")
     parser.add_argument("--verify-models", action="store_true")
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--credential", action="store_true")
