@@ -230,6 +230,84 @@ class GatewayDiscoveryTests(unittest.TestCase):
                                if path.parent == paths.desktop and path.name != "_meta.json")
                 self.assertEqual([item["name"] for item in json.loads(profile)["inferenceModels"]], settings["Models"])
 
+    def test_existing_direct_foundry_mode_is_switched_off_in_selected_user_settings(self):
+        settings = dict(SETTINGS, Models=["provider/claude-opus-5"],
+                        ModelMapping={"Opus": "provider/claude-opus-5"})
+        for clients in ({"CLI"}, {"VSCode"}, {"CLI", "VSCode"}):
+            for value in ("1", "true", True, "0", "false", False):
+                with self.subTest(clients=clients, value=value), tempfile.TemporaryDirectory(
+                        prefix="claude-foundry-switch-") as directory:
+                    paths = MODULE["Paths"](Path(directory))
+                    paths.code.parent.mkdir(parents=True)
+                    paths.vscode.parent.mkdir(parents=True)
+                    original_code = json.dumps({
+                        "keepMe": True, "env": {"CLAUDE_CODE_USE_FOUNDRY": value, "KEEP_ME": "unchanged"},
+                    })
+                    original_editor = json.dumps({
+                        "editor.fontSize": 16, "claudeCode.environmentVariables": [
+                            {"name": "CLAUDE_CODE_USE_FOUNDRY", "value": str(value)},
+                            {"name": "KEEP_ME", "value": "unchanged"},
+                        ],
+                    })
+                    paths.code.write_text(original_code)
+                    paths.vscode.write_text(original_editor)
+                    with patch.dict(MODULE["os"].environ, {}, clear=True):
+                        _, _, plan = MODULE["build_plan"](
+                            paths, settings, SOURCE, MODULE["sys"].executable, clients)
+                    config = json.loads(plan[paths.code][0])
+                    self.assertEqual(config["env"]["CLAUDE_CODE_USE_FOUNDRY"], "0")
+                    self.assertEqual(config["env"]["KEEP_ME"], "unchanged")
+                    self.assertTrue(config["keepMe"])
+                    self.assertEqual(config["env"]["ANTHROPIC_BASE_URL"], settings["GatewayBaseUrl"])
+                    if "VSCode" in clients:
+                        editor = json.loads(plan[paths.vscode][0])
+                        variables = editor["claudeCode.environmentVariables"]
+                        switches = [item for item in variables if item["name"] == "CLAUDE_CODE_USE_FOUNDRY"]
+                        self.assertEqual(switches, [{"name": "CLAUDE_CODE_USE_FOUNDRY", "value": "0"}])
+                        self.assertEqual(editor["editor.fontSize"], 16)
+                        self.assertIn({"name": "KEEP_ME", "value": "unchanged"}, variables)
+                    else:
+                        self.assertNotIn(paths.vscode, plan)
+                    self.assertEqual(paths.code.read_text(), original_code)
+                    self.assertEqual(paths.vscode.read_text(), original_editor)
+
+    def test_automatic_foundry_switch_does_not_allow_other_provider_or_credential_conflicts(self):
+        for name in MODULE["CONFLICTS"] - {"CLAUDE_CODE_USE_FOUNDRY"}:
+            with self.subTest(name=name), self.assertRaisesRegex(ERROR, name):
+                MODULE["check_environment"](
+                    {"CLAUDE_CODE_USE_FOUNDRY": "1", name: "offline-conflict"},
+                    "user settings", [], allow_foundry_switch=True)
+        with self.assertRaisesRegex(ERROR, "Credential headers"):
+            MODULE["check_environment"](
+                {"CLAUDE_CODE_USE_FOUNDRY": "1", "ANTHROPIC_CUSTOM_HEADERS": "Authorization: offline-conflict"},
+                "user settings", [], allow_foundry_switch=True)
+
+    def test_direct_foundry_mode_in_process_environment_still_stops_setup(self):
+        settings = dict(SETTINGS, Models=["provider/claude-opus-5"],
+                        ModelMapping={"Opus": "provider/claude-opus-5"})
+        with tempfile.TemporaryDirectory(prefix="claude-foundry-env-") as directory:
+            paths = MODULE["Paths"](Path(directory))
+            with patch.dict(MODULE["os"].environ, {"CLAUDE_CODE_USE_FOUNDRY": "1"}, clear=True):
+                with self.assertRaisesRegex(ERROR, "CLAUDE_CODE_USE_FOUNDRY in process environment"):
+                    MODULE["build_plan"](paths, settings, SOURCE, MODULE["sys"].executable, {"CLI"})
+                self.assertEqual(MODULE["os"].environ["CLAUDE_CODE_USE_FOUNDRY"], "1")
+            self.assertFalse(paths.code.exists())
+
+    def test_desktop_only_leaves_direct_foundry_code_settings_untouched(self):
+        settings = dict(SETTINGS, Models=["provider/claude-opus-5"],
+                        ModelMapping={"Opus": "provider/claude-opus-5"})
+        with tempfile.TemporaryDirectory(prefix="claude-foundry-desktop-") as directory:
+            paths = MODULE["Paths"](Path(directory))
+            paths.code.parent.mkdir(parents=True)
+            original = '{"env":{"CLAUDE_CODE_USE_FOUNDRY":"1"}}'
+            paths.code.write_text(original)
+            with patch.dict(MODULE["os"].environ, {}, clear=True):
+                _, _, plan = MODULE["build_plan"](
+                    paths, settings, SOURCE, MODULE["sys"].executable, {"Desktop"})
+            self.assertNotIn(paths.code, plan)
+            self.assertNotIn(paths.vscode, plan)
+            self.assertEqual(paths.code.read_text(), original)
+
 
 if __name__ == "__main__":
     unittest.main()

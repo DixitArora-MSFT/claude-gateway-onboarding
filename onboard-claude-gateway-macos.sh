@@ -591,10 +591,12 @@ def check_managed(paths, clients):
             raise SetupError("Managed Claude Code preferences must be updated by IT.")
 
 
-def check_environment(environment, source, aliases):
+def check_environment(environment, source, aliases, *, allow_foundry_switch=False):
     if not isinstance(environment, dict):
         raise SetupError(f"The env setting must be a JSON object: {source}")
     for name in CONFLICTS:
+        if name == "CLAUDE_CODE_USE_FOUNDRY" and allow_foundry_switch:
+            continue
         value = environment.get(name)
         disabled = name in PROVIDERS and str(value).strip().lower() in ("0", "false", "")
         if value and not disabled:
@@ -704,7 +706,7 @@ def build_plan(paths, settings, source, python_path, clients):
         check_environment(dict(os.environ), "process environment", aliases)
         config = read_json(paths.code)
         environment = config.setdefault("env", {})
-        check_environment(environment, str(paths.code), aliases)
+        check_environment(environment, str(paths.code), aliases, allow_foundry_switch=True)
         environment.pop("ANTHROPIC_MODEL", None)
         model_keys = {f"ANTHROPIC_DEFAULT_{family}_MODEL" for family in ("OPUS", "SONNET", "HAIKU")}
         for key in model_keys:
@@ -712,6 +714,7 @@ def build_plan(paths, settings, source, python_path, clients):
         gateway = {
             "ANTHROPIC_BASE_URL": settings["GatewayBaseUrl"],
             "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": "180000",
+            "CLAUDE_CODE_USE_FOUNDRY": "0",
         }
         gateway.update({f"ANTHROPIC_DEFAULT_{family.upper()}_MODEL": alias
                         for family, alias in settings["ModelMapping"].items()})
@@ -724,7 +727,8 @@ def build_plan(paths, settings, source, python_path, clients):
         if "VSCode" in clients:
             editor = read_json(paths.vscode)
             variables = vscode_environment(editor)
-            check_environment({item["name"]: item["value"] for item in variables}, str(paths.vscode), aliases)
+            check_environment({item["name"]: item["value"] for item in variables}, str(paths.vscode), aliases,
+                              allow_foundry_switch=True)
             variables = [item for item in variables if item["name"] not in gateway and
                          item["name"] not in model_keys and item["name"] != "ANTHROPIC_MODEL"]
             variables.extend({"name": key, "value": value} for key, value in gateway.items())
@@ -1021,6 +1025,9 @@ def onboard(options, source, paths):
         root, settings, plan = build_plan(paths, settings, source, python_path, clients)
         changed = commit_files(plan, root / "backups")
     log(f"Selected client configuration saved ({changed} files changed): {root}")
+    if clients & {"CLI", "VSCode"}:
+        log("Direct Foundry mode is disabled in the selected Claude Code user settings "
+            "(CLAUDE_CODE_USE_FOUNDRY=0). Existing credentials were not deleted.")
     if "CLI" in clients:
         log("Open a new Terminal in your project and run this detected supported CLI:\n" +
             shlex.quote(str(tools["CLI"])) + "\nCheck /status before sending a message.")

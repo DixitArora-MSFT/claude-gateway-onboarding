@@ -892,6 +892,7 @@ function Get-CodeGatewayEnvironment {
     $environment = [ordered]@{
         ANTHROPIC_BASE_URL = $Settings.GatewayBaseUrl
         CLAUDE_CODE_API_KEY_HELPER_TTL_MS = '180000'
+        CLAUDE_CODE_USE_FOUNDRY = '0'
     }
     foreach ($family in @('Opus', 'Sonnet', 'Haiku')) {
         if ($Settings.ModelMapping.$family) {
@@ -930,7 +931,8 @@ function Assert-CodeSettingsCompatible {
     )) {
         $isProviderSwitch = $name -like 'CLAUDE_CODE_USE_*'
         $value = $Settings.env.$name
-        if ($value -and (-not $isProviderSwitch -or (Test-CodeProviderEnabled -Value $value))) {
+        if ($name -ne 'CLAUDE_CODE_USE_FOUNDRY' -and
+            $value -and (-not $isProviderSwitch -or (Test-CodeProviderEnabled -Value $value))) {
             throw "Conflicting $name in $Source. Remove or resolve it before gateway onboarding; existing credentials will not be deleted."
         }
         foreach ($scope in @('Process', 'User', 'Machine')) {
@@ -989,7 +991,8 @@ function Install-CodeConfiguration {
     Backup-SettingsFile -Path $path -InstallRoot $InstallRoot
     Write-JsonFile -Path $path -Value $config
     $saved = Read-JsonSettings -Path $path
-    if ($saved.apiKeyHelper -ne $config.apiKeyHelper -or $saved.env.ANTHROPIC_BASE_URL -ne $Settings.GatewayBaseUrl) {
+    if ($saved.apiKeyHelper -ne $config.apiKeyHelper -or $saved.env.ANTHROPIC_BASE_URL -ne $Settings.GatewayBaseUrl -or
+        $saved.env.CLAUDE_CODE_USE_FOUNDRY -cne '0') {
         throw 'Saved Claude Code configuration did not match the onboarding settings.'
     }
 }
@@ -1025,6 +1028,9 @@ function Install-VSCodeConfiguration {
     if ($saved.'claudeCode.disableLoginPrompt' -ne $true -or
         @($saved.'claudeCode.environmentVariables' | Where-Object {
             $_.name -eq 'ANTHROPIC_BASE_URL' -and $_.value -eq $Settings.GatewayBaseUrl
+        }).Count -ne 1 -or
+        @($saved.'claudeCode.environmentVariables' | Where-Object {
+            $_.name -eq 'CLAUDE_CODE_USE_FOUNDRY' -and $_.value -ceq '0'
         }).Count -ne 1) {
         throw 'Saved VS Code configuration did not match the onboarding settings.'
     }
@@ -1253,6 +1259,7 @@ function Start-DeveloperOnboarding {
         }
     }
     if ($useCode) {
+        Write-Host 'Direct Foundry mode is disabled in the selected Claude Code user settings (CLAUDE_CODE_USE_FOUNDRY=0). Existing credentials were not deleted.'
         Write-Host 'Claude Code shared settings saved. CLI and VS Code use the same gateway; project or managed settings may take precedence.'
     }
     if ($useVSCode) {

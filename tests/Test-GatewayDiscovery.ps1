@@ -139,7 +139,40 @@ $settings | Add-Member ModelMapping (Resolve-CodeModelMapping -Catalog $catalog)
 $temp = Join-Path ([IO.Path]::GetTempPath()) ('claude-discovery-' + [Guid]::NewGuid())
 $oldProfile = $env:USERPROFILE
 $oldAppData = $env:APPDATA
-function Assert-CodeSettingsCompatible {}
+$script:testEnvironment = @{}
+$compatibilityFunction = ($functions | Where-Object { $_.Name -eq 'Assert-CodeSettingsCompatible' }).Extent.Text
+$compatibilityFunction = $compatibilityFunction.Replace(
+    "[Environment]::GetEnvironmentVariable('ANTHROPIC_CUSTOM_HEADERS', `$scope)",
+    '$script:testEnvironment["$scope|ANTHROPIC_CUSTOM_HEADERS"]')
+$compatibilityFunction = $compatibilityFunction.Replace(
+    '[Environment]::GetEnvironmentVariable($name, $scope)',
+    '$script:testEnvironment["$scope|$name"]')
+. ([scriptblock]::Create($compatibilityFunction))
+foreach ($value in @('1', 'true', $true, '0', 'false', $false)) {
+    Assert-CodeSettingsCompatible -Settings ([pscustomobject]@{
+        env = [pscustomobject]@{ CLAUDE_CODE_USE_FOUNDRY = $value }
+    }) -Source 'test user settings'
+}
+foreach ($scope in @('Process', 'User', 'Machine')) {
+    $script:testEnvironment["$scope|CLAUDE_CODE_USE_FOUNDRY"] = '1'
+    Assert-Fails {
+        Assert-CodeSettingsCompatible -Settings ([pscustomobject]@{
+            env = [pscustomobject]@{ CLAUDE_CODE_USE_FOUNDRY = '1' }
+        }) -Source 'test user settings'
+    } "CLAUDE_CODE_USE_FOUNDRY in the $scope environment"
+    $script:testEnvironment.Clear()
+}
+foreach ($name in @(
+    'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN',
+    'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_MANTLE',
+    'CLAUDE_CODE_USE_ANTHROPIC_AWS', 'CLAUDE_CONFIG_DIR'
+)) {
+    $environment = [pscustomobject]@{ CLAUDE_CODE_USE_FOUNDRY = '1' }
+    $environment | Add-Member -NotePropertyName $name -NotePropertyValue 'offline-conflict'
+    Assert-Fails {
+        Assert-CodeSettingsCompatible -Settings ([pscustomobject]@{ env = $environment }) -Source 'test user settings'
+    } "Conflicting $name"
+}
 try {
     $env:USERPROFILE = Join-Path $temp 'home'
     $env:APPDATA = Join-Path $temp 'appdata'
@@ -148,13 +181,41 @@ try {
     $vsPath = Join-Path $env:APPDATA 'Code\User\settings.json'
     [IO.Directory]::CreateDirectory((Split-Path $cliPath)) | Out-Null
     [IO.Directory]::CreateDirectory((Split-Path $vsPath)) | Out-Null
-    '{"keepMe":true,"env":{"ANTHROPIC_DEFAULT_HAIKU_MODEL":"old/haiku"}}' | Set-Content -LiteralPath $cliPath
-    '{"claudeCode.environmentVariables":[{"name":"ANTHROPIC_DEFAULT_HAIKU_MODEL","value":"old/haiku"}]}' | Set-Content -LiteralPath $vsPath
+    '{"keepMe":true,"env":{"CLAUDE_CODE_USE_FOUNDRY":"1","KEEP_ME":"unchanged","ANTHROPIC_DEFAULT_HAIKU_MODEL":"old/haiku"}}' | Set-Content -LiteralPath $cliPath
+    '{"editor.fontSize":16,"claudeCode.environmentVariables":[{"name":"CLAUDE_CODE_USE_FOUNDRY","value":"1"},{"name":"KEEP_ME","value":"unchanged"},{"name":"ANTHROPIC_DEFAULT_HAIKU_MODEL","value":"old/haiku"}]}' | Set-Content -LiteralPath $vsPath
+    $originalCli = [IO.File]::ReadAllBytes($cliPath)
+    $originalVSCode = [IO.File]::ReadAllBytes($vsPath)
+    Assert-Fails {
+        Invoke-ConfigurationUpdate -Paths @($cliPath, $vsPath) -Action {
+            Install-CodeConfiguration -Settings $settings -InstallRoot $installRoot -HelperPath 'C:\helpers\token.cmd'
+            Install-VSCodeConfiguration -Settings $settings -InstallRoot $installRoot
+            throw 'offline transaction failure'
+        }
+    } 'previous helper and client files were restored'
+    Assert-Equal ([Convert]::ToBase64String([IO.File]::ReadAllBytes($cliPath))) `
+        ([Convert]::ToBase64String($originalCli)) 'Failed migration restores original CLI settings'
+    Assert-Equal ([Convert]::ToBase64String([IO.File]::ReadAllBytes($vsPath))) `
+        ([Convert]::ToBase64String($originalVSCode)) 'Failed migration restores original VS Code settings'
     Install-CodeConfiguration -Settings $settings -InstallRoot $installRoot -HelperPath 'C:\helpers\token.cmd'
     Install-VSCodeConfiguration -Settings $settings -InstallRoot $installRoot
     $cli = Read-JsonSettings -Path $cliPath
     $editor = Read-JsonSettings -Path $vsPath
     Assert-Equal $cli.keepMe $true 'Unrelated settings preserved'
+    Assert-Equal $cli.env.CLAUDE_CODE_USE_FOUNDRY '0' 'Direct Foundry mode disabled in shared settings'
+    Assert-Equal $cli.env.KEEP_ME 'unchanged' 'Unrelated CLI environment preserved'
+    Assert-Equal $editor.'editor.fontSize' 16 'Unrelated VS Code settings preserved'
+    $foundry = @($editor.'claudeCode.environmentVariables' | Where-Object { $_.name -eq 'CLAUDE_CODE_USE_FOUNDRY' })
+    Assert-Equal $foundry.Count 1 'Exactly one VS Code Foundry switch'
+    Assert-Equal $foundry[0].value '0' 'Direct Foundry mode disabled in VS Code settings'
+    Assert-Equal ($editor.'claudeCode.environmentVariables' | Where-Object { $_.name -eq 'KEEP_ME' }).value `
+        'unchanged' 'Unrelated VS Code environment preserved'
+    $backups = @(Get-ChildItem -LiteralPath (Join-Path $installRoot 'backups') -Filter '*.bak')
+    Assert-Equal @($backups | Where-Object {
+        [Convert]::ToBase64String([IO.File]::ReadAllBytes($_.FullName)) -ceq [Convert]::ToBase64String($originalCli)
+    }).Count 2 'Original CLI settings backed up before each migration attempt'
+    Assert-Equal @($backups | Where-Object {
+        [Convert]::ToBase64String([IO.File]::ReadAllBytes($_.FullName)) -ceq [Convert]::ToBase64String($originalVSCode)
+    }).Count 2 'Original VS Code settings backed up before each migration attempt'
     Assert-Equal $cli.enforceAvailableModels $true 'Only discovered models are listed'
     Assert-Equal ($cli.availableModels -join ',') ($settings.Models -join ',') 'CLI model list'
     Assert-Equal $cli.modelPicker.replaceBuiltInOptions $true 'Built-in picker rows are replaced'
@@ -164,6 +225,23 @@ try {
     Assert-Equal @($editor.'claudeCode.environmentVariables' | Where-Object {
         $_.name -eq 'ANTHROPIC_DEFAULT_HAIKU_MODEL'
     }).Count 0 'Stale VS Code Haiku mapping removed'
+    Install-CodeConfiguration -Settings $settings -InstallRoot $installRoot -HelperPath 'C:\helpers\token.cmd'
+    Install-VSCodeConfiguration -Settings $settings -InstallRoot $installRoot
+    $rerun = Read-JsonSettings -Path $vsPath
+    Assert-Equal @($rerun.'claudeCode.environmentVariables' | Where-Object {
+        $_.name -eq 'CLAUDE_CODE_USE_FOUNDRY'
+    }).Count 1 'Rerunning onboarding does not duplicate the Foundry switch'
+    $conflicting = Read-JsonSettings -Path $cliPath
+    $conflicting.env | Add-Member -NotePropertyName ANTHROPIC_AUTH_TOKEN -NotePropertyValue 'offline-existing-credential'
+    Write-JsonFile -Path $cliPath -Value $conflicting
+    $beforeConflict = [Convert]::ToBase64String([IO.File]::ReadAllBytes($cliPath))
+    Assert-Fails {
+        Install-CodeConfiguration -Settings $settings -InstallRoot $installRoot -HelperPath 'C:\helpers\token.cmd'
+    } 'Conflicting ANTHROPIC_AUTH_TOKEN'
+    Assert-Equal ([Convert]::ToBase64String([IO.File]::ReadAllBytes($cliPath))) `
+        $beforeConflict 'Existing conflicting credentials are not modified'
+    $conflicting.env.PSObject.Properties.Remove('ANTHROPIC_AUTH_TOKEN')
+    Write-JsonFile -Path $cliPath -Value $conflicting
     $settings | Add-Member ConfigId ([Guid]::NewGuid().ToString())
     $desktopDir = Join-Path $temp 'desktop'
     Install-DesktopConfiguration -Settings $settings -InstallRoot $installRoot `
@@ -181,4 +259,4 @@ finally {
     $env:APPDATA = $oldAppData
     if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Recurse -Force }
 }
-Write-Output 'Windows automatic discovery, RBAC filtering, model mapping, and client configuration checks passed.'
+Write-Output 'Windows discovery, RBAC, mapping, client configuration, and direct Foundry migration checks passed.'

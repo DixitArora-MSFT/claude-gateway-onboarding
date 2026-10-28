@@ -143,8 +143,13 @@ you intentionally want a small paid inference check for every discovered alias.
 - Saves your company's connection details and approved model list, so you do not
   need to fill in the Claude Desktop settings yourself.
 - Keeps unrelated settings and backs up existing files before changing them.
-- Stops and asks for IT assistance if settings conflict or company policies
-  prevent setup.
+- Automatically switches existing direct Foundry mode to gateway mode for CLI
+  and VS Code by saving `CLAUDE_CODE_USE_FOUNDRY=0` in the selected user settings,
+  and displays a message. The previous settings are backed up; credentials are
+  not deleted. Desktop-only setup does not change Claude Code settings.
+- Stops and asks for IT assistance for other conflicting credentials/provider
+  settings, enabled provider switches in the environment, or company policies.
+  Environment variables and managed policies are not changed.
 
 **What you need to do:** Run the command supplied by IT, sign in with your work
 account if prompted, and complete any required approval or verification steps.
