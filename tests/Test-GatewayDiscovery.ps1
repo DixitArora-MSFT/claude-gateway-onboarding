@@ -58,13 +58,30 @@ function Invoke-NativeCapture {
     }
     [pscustomobject]@{ ExitCode = 0; Output = 'offline-token' }
 }
+function Reset-GatewayLookupFixture {
+    $script:lookupData = @([pscustomobject]@{ id = $root })
+    $script:lookupPages = @{ first = [pscustomobject]@{ data = @() } }
+    $script:gatewayMetadata = @{}
+    $script:gatewayFailures = @{}
+    $script:catalogCalls = @()
+}
+Reset-GatewayLookupFixture
 function Invoke-GatewayCatalogRequest {
     param([string]$Uri, [string]$Token, $Body)
     Assert-Equal $Token 'offline-token' 'Token'
+    $script:catalogCalls += [pscustomobject]@{ Uri = $Uri; Body = $Body }
     if ($Uri -like '*/Microsoft.ResourceGraph/resources?*') {
-        if ($Body.query -notlike "*$hostUrl*") { throw 'Lookup must use the supplied host.' }
-        return [pscustomobject]@{ data = @([pscustomobject]@{ id = $root }) }
+        if ($Body.query -like "*$hostUrl*") { return [pscustomobject]@{ data = $script:lookupData } }
+        if ($Body.query -notlike '* | project id' -or $Body.query -like '*properties.*') {
+            throw 'Fallback must enumerate IDs without filtering on unindexed metadata.'
+        }
+        $key = $Body.options['$skipToken']
+        if (-not $key) { $key = 'first' }
+        return $script:lookupPages[$key]
     }
+    $resource = ([Uri]$Uri).AbsolutePath
+    if ($script:gatewayFailures.ContainsKey($resource)) { throw $script:gatewayFailures[$resource] }
+    if ($script:gatewayMetadata.ContainsKey($resource)) { return $script:gatewayMetadata[$resource] }
     if ($Uri -eq "https://management.azure.com${root}?api-version=2025-09-01-preview") {
         return [pscustomobject]@{ properties = [pscustomobject]@{
             frontend = [pscustomobject]@{ defaultHostname = 'example.ai.gateway.azure.com' }
@@ -131,6 +148,115 @@ Assert-Equal (Test-GatewayModelInvocation -Permissions @($excluded, [pscustomobj
     dataActions=@('Microsoft.ApiManagement/service/workspaces/models/*')
 })) $true 'Additive role assignments'
 Assert-Fails { & $originalRequest -Uri "https://example.org$scope/aliases" -Token 'offline-token' } 'invalid Azure management URL'
+
+$script:entries = @((New-TestAlias 0 'claude-opus-5'))
+Reset-GatewayLookupFixture
+$null = Get-GatewayModelCatalog -Settings $settings
+Assert-Equal @($catalogCalls | Where-Object { $_.Uri -like '*/Microsoft.ResourceGraph/resources?*' }).Count `
+    1 'Indexed hostname uses only the fast lookup'
+foreach ($lookupMatches in @(@(), @([pscustomobject]@{ id = $root }, [pscustomobject]@{ id = "$root-other" }))) {
+    Reset-GatewayLookupFixture
+    $script:lookupData = $lookupMatches
+    Assert-Fails { Get-GatewayModelCatalog -Settings $settings } 'uniquely find'
+}
+Reset-GatewayLookupFixture
+$script:lookupData = @()
+$script:lookupPages.first = [pscustomobject]@{ data = @([pscustomobject]@{ id = $root }) }
+$catalog = @(Get-GatewayModelCatalog -Settings $settings)
+Assert-Equal $catalog.Count 1 'Unindexed hostname resolves from current ARM metadata'
+Assert-Equal @($catalogCalls | Where-Object {
+    $_.Uri -eq "https://management.azure.com${root}?api-version=2025-09-01-preview"
+}).Count 1 'Matching gateway metadata is read only once'
+$script:gatewayMetadata[$root] = [pscustomobject]@{
+    properties = [pscustomobject]@{
+        gatewayUrl = $null
+        frontend = [pscustomobject]@{ defaultHostname = 'example.ai.gateway.azure.com' }
+    }
+}
+Assert-Equal @(Get-GatewayModelCatalog -Settings $settings).Count 1 `
+    'Unindexed gateway resolves from ARM defaultHostname when gatewayUrl is null'
+
+$otherRoot = "$root-other"
+Reset-GatewayLookupFixture
+$script:lookupData = @()
+$script:gatewayMetadata[$otherRoot] = [pscustomobject]@{
+    properties = [pscustomobject]@{ gatewayUrl = 'https://other.ai.gateway.azure.com' }
+}
+$script:lookupPages = @{
+    first = [pscustomobject]@{ data = @([pscustomobject]@{ id = $otherRoot }); '$skipToken' = 'second'; resultTruncated = 'true' }
+    second = [pscustomobject]@{ data = @([pscustomobject]@{ id = $otherRoot.ToUpperInvariant() }, [pscustomobject]@{ id = $root }) }
+}
+Assert-Equal @(Get-GatewayModelCatalog -Settings $settings).Count 1 'Fallback checks later pages'
+Assert-Equal @($catalogCalls | Where-Object {
+    $_.Uri -eq "https://management.azure.com${otherRoot}?api-version=2025-09-01-preview"
+}).Count 1 'Duplicate resource IDs are read once, ignoring case'
+
+Reset-GatewayLookupFixture
+$script:lookupData = @()
+$script:lookupPages.first = [pscustomobject]@{ data = @([pscustomobject]@{ id = $root }) }
+$script:gatewayMetadata[$root] = [pscustomobject]@{
+    properties = [pscustomobject]@{ gatewayUrl = $hostUrl.ToUpperInvariant() + '/'; frontend = $null }
+}
+Assert-Equal @(Get-GatewayModelCatalog -Settings $settings).Count 1 'Gateway URL handles case and trailing slash'
+$script:gatewayMetadata[$root] = [pscustomobject]@{
+    properties = [pscustomobject]@{ gatewayUrl = 'https://wrong.ai.gateway.azure.com' }
+}
+Assert-Fails { Get-GatewayModelCatalog -Settings $settings } 'uniquely find'
+$script:gatewayMetadata[$root] = [pscustomobject]@{
+    properties = [pscustomobject]@{ gatewayUrl = $null; frontend = [pscustomobject]@{ defaultHostname = $null } }
+}
+Assert-Fails { Get-GatewayModelCatalog -Settings $settings } 'uniquely find'
+$script:gatewayFailures[$root] = 'offline ARM read denied'
+Assert-Fails { Get-GatewayModelCatalog -Settings $settings } 'offline ARM read denied'
+
+Reset-GatewayLookupFixture
+$script:lookupData = @()
+$script:gatewayMetadata[$otherRoot] = [pscustomobject]@{ properties = [pscustomobject]@{ gatewayUrl = $hostUrl } }
+$script:lookupPages = @{
+    first = [pscustomobject]@{ data = @([pscustomobject]@{ id = $root }); '$skipToken' = 'second' }
+    second = [pscustomobject]@{ data = @([pscustomobject]@{ id = $otherRoot }) }
+}
+Assert-Fails { Get-GatewayModelCatalog -Settings $settings } 'uniquely find'
+Assert-Equal @($catalogCalls | Where-Object { ([Uri]$_.Uri).AbsolutePath -eq "$scope/aliases" }).Count `
+    0 'Ambiguous hostname does not read models'
+
+foreach ($invalidId in @('https://example.org', ($root + '?redirect=other'), $null, 123)) {
+    Reset-GatewayLookupFixture
+    $script:lookupData = @()
+    $script:lookupPages.first = [pscustomobject]@{ data = @([pscustomobject]@{ id = $invalidId }) }
+    Assert-Fails { Get-GatewayModelCatalog -Settings $settings } 'invalid gateway resource ID'
+    Assert-Equal @($catalogCalls | Where-Object { $_.Uri -notlike '*/Microsoft.ResourceGraph/resources?*' }).Count `
+        0 'Invalid IDs are rejected before a direct resource read'
+}
+foreach ($fallback in @($false, $true)) {
+    Reset-GatewayLookupFixture
+    if ($fallback) {
+        $script:lookupData = @()
+        $script:lookupPages.first = [pscustomobject]@{ data = $null }
+    } else {
+        $script:lookupData = $null
+    }
+    Assert-Fails { Get-GatewayModelCatalog -Settings $settings } 'invalid gateway list'
+}
+foreach ($nextToken in @('second', 123)) {
+    Reset-GatewayLookupFixture
+    $script:lookupData = @()
+    $script:lookupPages = @{
+        first = [pscustomobject]@{ data = @([pscustomobject]@{ id = $root }); '$skipToken' = 'second' }
+        second = [pscustomobject]@{ data = @(); '$skipToken' = $nextToken }
+    }
+    Assert-Fails { Get-GatewayModelCatalog -Settings $settings } 'continuation token'
+}
+Reset-GatewayLookupFixture
+$script:lookupData = @()
+$script:lookupPages.first = [pscustomobject]@{ data = @([pscustomobject]@{ id = $root }); resultTruncated = 'true' }
+Assert-Fails { Get-GatewayModelCatalog -Settings $settings } 'truncated'
+Reset-GatewayLookupFixture
+$script:gatewayMetadata[$root] = [pscustomobject]@{
+    properties = [pscustomobject]@{ gatewayUrl = 'https://stale.ai.gateway.azure.com' }
+}
+Assert-Fails { Get-GatewayModelCatalog -Settings $settings } 'hostname does not match'
+Reset-GatewayLookupFixture
 
 $script:entries = @((New-TestAlias 0 'claude-opus-5'))
 $catalog = @(Get-GatewayModelCatalog -Settings $settings)

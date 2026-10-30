@@ -117,7 +117,12 @@ continues to work. No developer needs to construct the endpoint path.
 ### Automatic model discovery
 
 After work-account sign-in, both scripts find the gateway from its runtime
-hostname using Azure Resource Graph. They read its published aliases, check the
+hostname using Azure Resource Graph. If Resource Graph does not index the
+hostname fields, they enumerate accessible gateway resource IDs across all result
+pages and check current Azure Resource Manager metadata for an exact hostname
+match. They stop if no unique gateway matches; resource names are never guessed
+from the URL. This fallback does not require developers to enter resource IDs or
+grant additional permissions. They read its published aliases, check the
 signed-in user's model-invocation permissions, and read backend model metadata.
 Only permitted Claude aliases supporting Anthropic Messages are configured;
 OpenAI, DeepSeek, embeddings, and other incompatible models are excluded.

@@ -162,6 +162,81 @@ function Test-GatewayModelInvocation {
     return $false
 }
 
+function Test-GatewayHostname {
+    param([string]$Root, [Uri]$Endpoint, [string]$Token)
+
+    if ($Root -notmatch '^/subscriptions/[0-9a-f-]{36}/resourceGroups/[^/?#]+/providers/Microsoft\.ApiManagement/(aigateways|service)/[^/?#]+$') {
+        throw 'Discovery returned an invalid gateway resource ID.'
+    }
+    $gateway = Invoke-GatewayCatalogRequest -Token $Token `
+        -Uri "https://management.azure.com${Root}?api-version=2025-09-01-preview"
+    if ($gateway.properties -isnot [pscustomobject] -or
+        ($null -ne $gateway.properties.frontend -and $gateway.properties.frontend -isnot [pscustomobject])) {
+        throw 'The gateway returned invalid hostname metadata.'
+    }
+    return (([string]$gateway.properties.gatewayUrl).TrimEnd('/') -eq $Endpoint.GetLeftPart([UriPartial]::Authority) -or
+        $gateway.properties.frontend.defaultHostname -eq $Endpoint.Host)
+}
+
+function Resolve-GatewayResource {
+    param([Uri]$Endpoint, [string]$Token)
+
+    $hostUrl = $Endpoint.GetLeftPart([UriPartial]::Authority)
+    $resourceQuery = "Resources | where type in~ ('microsoft.apimanagement/aigateways', 'microsoft.apimanagement/service')"
+    $lookupUrl = 'https://management.azure.com/providers/Microsoft.ResourceGraph/resources?api-version=2022-10-01'
+    $query = $resourceQuery +
+        " | where tostring(properties.gatewayUrl) =~ '$hostUrl' or tostring(properties.frontend.defaultHostname) =~ '$($Endpoint.Host)'" +
+        ' | project id'
+    $lookup = Invoke-GatewayCatalogRequest -Token $Token -Uri $lookupUrl `
+        -Body @{ query = $query; options = @{ resultFormat = 'objectArray'; allowPartialScopes = $true; '$top' = 2 } }
+    if ($lookup.data -isnot [Array] -or @($lookup.data | Where-Object { $_ -isnot [pscustomobject] }).Count) {
+        throw 'Resource Graph returned an invalid gateway list.'
+    }
+    $failure = 'Cannot uniquely find this gateway from its URL. Check the URL and gateway read access, or allow time for Azure Resource Graph indexing.'
+    if ($lookup.data.Count -gt 1) { throw $failure }
+    if ($lookup.data.Count -eq 1) {
+        $root = [string]$lookup.data[0].id
+        if (-not (Test-GatewayHostname -Root $root -Endpoint $Endpoint -Token $Token)) {
+            throw 'The current gateway hostname does not match the supplied URL. Azure Resource Graph might still be indexing a change.'
+        }
+        return $root
+    }
+
+    Write-Host 'Gateway hostname is not indexed in Resource Graph; checking current gateway metadata...'
+    $roots = @()
+    $seenRoots = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $seenTokens = New-Object 'Collections.Generic.HashSet[string]'
+    $options = @{ resultFormat = 'objectArray'; allowPartialScopes = $true; '$top' = 1000 }
+    while ($true) {
+        $page = Invoke-GatewayCatalogRequest -Token $Token -Uri $lookupUrl `
+            -Body @{ query = $resourceQuery + ' | project id'; options = $options }
+        if ($page.data -isnot [Array] -or @($page.data | Where-Object { $_ -isnot [pscustomobject] }).Count) {
+            throw 'Resource Graph returned an invalid gateway list.'
+        }
+        foreach ($candidate in $page.data) {
+            if ($candidate.id -isnot [string]) { throw 'Discovery returned an invalid gateway resource ID.' }
+            if (-not $seenRoots.Add($candidate.id)) { continue }
+            if (Test-GatewayHostname -Root $candidate.id -Endpoint $Endpoint -Token $Token) {
+                $roots += $candidate.id
+                if ($roots.Count -gt 1) { throw $failure }
+            }
+        }
+        $nextToken = $page.'$skipToken'
+        if ($null -eq $nextToken -or $nextToken -ceq '') {
+            if ([string]$page.resultTruncated -eq 'true') {
+                throw 'Resource Graph truncated the gateway list without a continuation token.'
+            }
+            break
+        }
+        if ($nextToken -isnot [string] -or -not $seenTokens.Add($nextToken)) {
+            throw 'Resource Graph returned an invalid or repeated gateway continuation token.'
+        }
+        $options['$skipToken'] = $nextToken
+    }
+    if ($roots.Count -ne 1) { throw $failure }
+    return $roots[0]
+}
+
 function Get-GatewayModelCatalog {
     param($Settings)
 
@@ -175,26 +250,8 @@ function Get-GatewayModelCatalog {
     }
     $token = $result.Output
     $endpoint = [Uri]$Settings.GatewayBaseUrl
-    $hostUrl = $endpoint.GetLeftPart([UriPartial]::Authority)
-    $query = "Resources | where type in~ ('microsoft.apimanagement/aigateways', 'microsoft.apimanagement/service')" +
-        " | where tostring(properties.gatewayUrl) =~ '$hostUrl' or tostring(properties.frontend.defaultHostname) =~ '$($endpoint.Host)'" +
-        ' | project id'
-    $lookup = Invoke-GatewayCatalogRequest -Token $token `
-        -Uri 'https://management.azure.com/providers/Microsoft.ResourceGraph/resources?api-version=2022-10-01' `
-        -Body @{ query = $query; options = @{ resultFormat = 'objectArray'; allowPartialScopes = $true; '$top' = 2 } }
-    if (@($lookup.data).Count -ne 1 -or -not $lookup.data[0].id) {
-        throw 'Cannot uniquely find this gateway from its URL. Check the URL and gateway read access, or allow time for Azure Resource Graph indexing.'
-    }
-    $root = [string]$lookup.data[0].id
-    if ($root -notmatch '^/subscriptions/[0-9a-f-]{36}/resourceGroups/[^/?#]+/providers/Microsoft\.ApiManagement/(aigateways|service)/[^/?#]+$') {
-        throw 'Discovery returned an invalid gateway resource ID.'
-    }
+    $root = Resolve-GatewayResource -Endpoint $endpoint -Token $token
     $version = '2025-09-01-preview'
-    $gateway = Invoke-GatewayCatalogRequest -Token $token -Uri "https://management.azure.com${root}?api-version=$version"
-    if (([string]$gateway.properties.gatewayUrl).TrimEnd('/') -ne $hostUrl -and
-        $gateway.properties.frontend.defaultHostname -ne $endpoint.Host) {
-        throw 'The current gateway hostname does not match the supplied URL. Azure Resource Graph might still be indexing a change.'
-    }
     $workspace = $endpoint.AbsolutePath.TrimEnd('/').Split('/')[-3]
     $scope = "$root/workspaces/$workspace"
     $aliases = @(Get-GatewayCatalogItems -Token $token -Scope $scope `

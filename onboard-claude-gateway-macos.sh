@@ -412,6 +412,81 @@ def can_invoke_model(permissions):
     return False
 
 
+def gateway_matches_hostname(root, endpoint, token):
+    if not isinstance(root, str) or not re.fullmatch(
+            r"/subscriptions/[0-9a-f-]{36}/resourceGroups/[^/?#]+/providers/Microsoft\.ApiManagement/(aigateways|service)/[^/?#]+",
+            root, re.I):
+        raise SetupError("Discovery returned an invalid gateway resource ID.")
+    gateway = catalog_request(
+        f"https://management.azure.com{root}?api-version=2025-09-01-preview", token).get("properties")
+    if not isinstance(gateway, dict):
+        raise SetupError("The gateway returned invalid hostname metadata.")
+    frontend = gateway.get("frontend")
+    if frontend is None:
+        frontend = {}
+    if not isinstance(frontend, dict):
+        raise SetupError("The gateway returned invalid hostname metadata.")
+    origin = urllib.parse.urlunsplit(("https", endpoint.hostname, "", "", ""))
+    return (str(gateway.get("gatewayUrl", "")).rstrip("/").lower() == origin.lower() or
+            str(frontend.get("defaultHostname", "")).lower() == endpoint.hostname)
+
+
+def resolve_gateway_resource(endpoint, token):
+    origin = urllib.parse.urlunsplit(("https", endpoint.hostname, "", "", ""))
+    resource_query = "Resources | where type in~ ('microsoft.apimanagement/aigateways', 'microsoft.apimanagement/service')"
+    lookup_url = "https://management.azure.com/providers/Microsoft.ResourceGraph/resources?api-version=2022-10-01"
+    query = (resource_query +
+             f" | where tostring(properties.gatewayUrl) =~ '{origin}' or tostring(properties.frontend.defaultHostname) =~ '{endpoint.hostname}'" +
+             " | project id")
+    lookup = catalog_request(lookup_url, token, {
+        "query": query, "options": {"resultFormat": "objectArray", "allowPartialScopes": True, "$top": 2},
+    })
+    matches = lookup.get("data")
+    if not isinstance(matches, list) or any(not isinstance(item, dict) for item in matches):
+        raise SetupError("Resource Graph returned an invalid gateway list.")
+    failure = ("Cannot uniquely find this gateway from its URL. Check the URL and gateway read access, "
+               "or allow time for Azure Resource Graph indexing.")
+    if len(matches) > 1:
+        raise SetupError(failure)
+    if matches:
+        root = matches[0].get("id")
+        if not gateway_matches_hostname(root, endpoint, token):
+            raise SetupError("The current gateway hostname does not match the supplied URL. Azure Resource Graph might still be indexing a change.")
+        return root
+
+    log("Gateway hostname is not indexed in Resource Graph; checking current gateway metadata...")
+    roots, seen_roots, seen_tokens = [], set(), set()
+    options = {"resultFormat": "objectArray", "allowPartialScopes": True, "$top": 1000}
+    while True:
+        page = catalog_request(lookup_url, token, {"query": resource_query + " | project id", "options": dict(options)})
+        candidates = page.get("data")
+        if not isinstance(candidates, list) or any(not isinstance(item, dict) for item in candidates):
+            raise SetupError("Resource Graph returned an invalid gateway list.")
+        for candidate in candidates:
+            root = candidate.get("id")
+            if not isinstance(root, str):
+                raise SetupError("Discovery returned an invalid gateway resource ID.")
+            if root.lower() in seen_roots:
+                continue
+            seen_roots.add(root.lower())
+            if gateway_matches_hostname(root, endpoint, token):
+                roots.append(root)
+                if len(roots) > 1:
+                    raise SetupError(failure)
+        next_token = page.get("$skipToken")
+        if next_token is None or next_token == "":
+            if str(page.get("resultTruncated", False)).lower() == "true":
+                raise SetupError("Resource Graph truncated the gateway list without a continuation token.")
+            break
+        if not isinstance(next_token, str) or next_token in seen_tokens:
+            raise SetupError("Resource Graph returned an invalid or repeated gateway continuation token.")
+        seen_tokens.add(next_token)
+        options["$skipToken"] = next_token
+    if len(roots) != 1:
+        raise SetupError(failure)
+    return roots[0]
+
+
 def discover_models(settings):
     environment = dict(os.environ)
     if settings.get("AzureConfigDir"):
@@ -423,29 +498,8 @@ def discover_models(settings):
         raise SetupError("Cannot acquire an Azure management token for automatic model discovery. Check sign-in and gateway catalog read access.")
     token = result.stdout.strip()
     endpoint = urllib.parse.urlsplit(settings["GatewayBaseUrl"])
-    origin = urllib.parse.urlunsplit(("https", endpoint.hostname, "", "", ""))
-    query = ("Resources | where type in~ ('microsoft.apimanagement/aigateways', 'microsoft.apimanagement/service')" +
-             f" | where tostring(properties.gatewayUrl) =~ '{origin}' or tostring(properties.frontend.defaultHostname) =~ '{endpoint.hostname}'" +
-             " | project id")
-    lookup = catalog_request(
-        "https://management.azure.com/providers/Microsoft.ResourceGraph/resources?api-version=2022-10-01", token,
-        {"query": query, "options": {"resultFormat": "objectArray", "allowPartialScopes": True, "$top": 2}},
-    )
-    matches = lookup.get("data")
-    if not isinstance(matches, list) or len(matches) != 1 or not isinstance(matches[0], dict):
-        raise SetupError("Cannot uniquely find this gateway from its URL. Check the URL and gateway read access, or allow time for Azure Resource Graph indexing.")
-    root = matches[0].get("id", "")
-    if not isinstance(root, str) or not re.fullmatch(
-            r"/subscriptions/[0-9a-f-]{36}/resourceGroups/[^/?#]+/providers/Microsoft\.ApiManagement/(aigateways|service)/[^/?#]+",
-            root, re.I):
-        raise SetupError("Discovery returned an invalid gateway resource ID.")
+    root = resolve_gateway_resource(endpoint, token)
     version = "2025-09-01-preview"
-    gateway = catalog_request(f"https://management.azure.com{root}?api-version={version}", token).get("properties")
-    if not isinstance(gateway, dict) or not isinstance(gateway.get("frontend", {}), dict):
-        raise SetupError("The gateway returned invalid hostname metadata.")
-    if (str(gateway.get("gatewayUrl", "")).rstrip("/").lower() != origin.lower() and
-            str(gateway.get("frontend", {}).get("defaultHostname", "")).lower() != endpoint.hostname):
-        raise SetupError("The current gateway hostname does not match the supplied URL. Azure Resource Graph might still be indexing a change.")
     workspace = endpoint.path.rstrip("/").split("/")[-3]
     scope = root + "/workspaces/" + workspace
     catalog, models, seen_aliases = [], {}, set()

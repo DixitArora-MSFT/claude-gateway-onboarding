@@ -35,6 +35,8 @@ class CatalogFixture:
         self.entries = entries
         self.calls = []
         self.lookup = {"data": [{"id": ROOT}]}
+        self.lookup_pages = {None: {"data": []}}
+        self.gateways = {}
         self.host = ORIGIN
         self.page_size = len(entries) or 1
 
@@ -42,9 +44,17 @@ class CatalogFixture:
         self.calls.append((url, body))
         self.assert_valid_token(token)
         if "/Microsoft.ResourceGraph/resources?" in url:
-            if ORIGIN not in body["query"]:
-                raise AssertionError("Lookup must use the supplied host.")
-            return self.lookup
+            if ORIGIN in body["query"]:
+                return self.lookup
+            if " | project id" not in body["query"] or "properties." in body["query"]:
+                raise AssertionError("Fallback must enumerate IDs without filtering on unindexed metadata.")
+            return self.lookup_pages[body["options"].get("$skipToken")]
+        resource = url.removeprefix("https://management.azure.com").split("?")[0]
+        if resource in self.gateways:
+            response = self.gateways[resource]
+            if isinstance(response, Exception):
+                raise response
+            return response
         if url == f"https://management.azure.com{ROOT}?api-version=2025-09-01-preview":
             return {"properties": {"frontend": {"defaultHostname": self.host.removeprefix("https://")}}}
         if "/aliases?api-version=" in url or "/aliases?next=" in url:
@@ -136,6 +146,116 @@ class GatewayDiscoveryTests(unittest.TestCase):
         fixture.host = "https://different.ai.gateway.azure.com"
         with self.assertRaisesRegex(ERROR, "hostname"):
             self.discover(fixture)
+
+    def unindexed_fixture(self):
+        fixture = CatalogFixture([alias(0, "claude-opus-5")])
+        fixture.lookup = {"data": []}
+        fixture.lookup_pages = {None: {"data": [{"id": ROOT}]}}
+        return fixture
+
+    def test_unindexed_hostname_resolves_from_current_arm_metadata(self):
+        fixture = self.unindexed_fixture()
+        catalog = self.discover(fixture)
+        self.assertEqual([item["Alias"] for item in catalog], ["provider/claude-opus-5"])
+        self.assertEqual(len([url for url, _ in fixture.calls
+                              if url == f"https://management.azure.com{ROOT}?api-version=2025-09-01-preview"]), 1)
+
+    def test_indexed_hostname_does_not_enumerate_other_gateways(self):
+        fixture = CatalogFixture([alias(0, "claude-opus-5")])
+        self.discover(fixture)
+        self.assertEqual(len([url for url, _ in fixture.calls if "/Microsoft.ResourceGraph/resources?" in url]), 1)
+
+    def test_unindexed_hostname_resolves_when_arm_gateway_url_is_null(self):
+        fixture = self.unindexed_fixture()
+        fixture.gateways[ROOT] = {"properties": {
+            "gatewayUrl": None,
+            "frontend": {"defaultHostname": ORIGIN.removeprefix("https://")},
+        }}
+        self.assertEqual(len(self.discover(fixture)), 1)
+
+    def test_unindexed_lookup_checks_every_page_and_deduplicates_resources(self):
+        fixture = self.unindexed_fixture()
+        other = ROOT + "-other"
+        fixture.gateways[other] = {"properties": {"gatewayUrl": "https://other.ai.gateway.azure.com"}}
+        fixture.lookup_pages = {
+            None: {"data": [{"id": other}], "$skipToken": "second", "resultTruncated": "true"},
+            "second": {"data": [{"id": other.upper()}, {"id": ROOT}]},
+        }
+        self.assertEqual(len(self.discover(fixture)), 1)
+        self.assertEqual(len([url for url, _ in fixture.calls if url.startswith(f"https://management.azure.com{other}?")]), 1)
+
+    def test_gateway_url_alone_accepts_case_and_trailing_slash(self):
+        fixture = self.unindexed_fixture()
+        fixture.gateways[ROOT] = {"properties": {"gatewayUrl": ORIGIN.upper() + "/", "frontend": None}}
+        self.assertEqual(len(self.discover(fixture)), 1)
+
+    def test_unindexed_lookup_rejects_multiple_current_hostname_matches(self):
+        fixture = self.unindexed_fixture()
+        other = ROOT + "-other"
+        fixture.gateways[other] = {"properties": {"gatewayUrl": ORIGIN}}
+        fixture.lookup_pages = {
+            None: {"data": [{"id": ROOT}], "$skipToken": "second"},
+            "second": {"data": [{"id": other}]},
+        }
+        with self.assertRaisesRegex(ERROR, "uniquely find"):
+            self.discover(fixture)
+        self.assertFalse(any("/aliases?" in url for url, _ in fixture.calls))
+
+    def test_unindexed_lookup_does_not_assume_resource_name_matches_runtime(self):
+        fixture = self.unindexed_fixture()
+        fixture.gateways[ROOT] = {"properties": {"gatewayUrl": "https://wrong.ai.gateway.azure.com"}}
+        with self.assertRaisesRegex(ERROR, "uniquely find"):
+            self.discover(fixture)
+
+    def test_unindexed_lookup_still_requires_current_hostname_metadata(self):
+        for properties in ({"gatewayUrl": None, "frontend": {"defaultHostname": None}},
+                           {"frontend": None}, {}):
+            fixture = self.unindexed_fixture()
+            fixture.gateways[ROOT] = {"properties": properties}
+            with self.subTest(properties=properties), self.assertRaisesRegex(ERROR, "uniquely find"):
+                self.discover(fixture)
+
+    def test_unindexed_lookup_propagates_arm_read_failures(self):
+        fixture = self.unindexed_fixture()
+        fixture.gateways[ROOT] = ERROR("offline ARM read denied")
+        with self.assertRaisesRegex(ERROR, "offline ARM read denied"):
+            self.discover(fixture)
+
+    def test_unindexed_lookup_rejects_invalid_ids_before_reading_them(self):
+        for root in ("https://example.org", ROOT + "?redirect=other", None, 123):
+            fixture = self.unindexed_fixture()
+            fixture.lookup_pages = {None: {"data": [{"id": root}]}}
+            with self.subTest(root=root), self.assertRaisesRegex(ERROR, "invalid gateway resource ID"):
+                self.discover(fixture)
+            self.assertTrue(all("/Microsoft.ResourceGraph/resources?" in url for url, _ in fixture.calls))
+
+    def test_invalid_resource_graph_lists_fail_explicitly(self):
+        for data in (None, {}, [None]):
+            for fallback in (False, True):
+                fixture = self.unindexed_fixture()
+                if fallback:
+                    fixture.lookup_pages = {None: {"data": data}}
+                else:
+                    fixture.lookup = {"data": data}
+                with self.subTest(data=data, fallback=fallback), self.assertRaisesRegex(ERROR, "invalid gateway list"):
+                    self.discover(fixture)
+
+    def test_unindexed_lookup_rejects_repeated_or_invalid_continuation(self):
+        for next_token in ("second", 123):
+            fixture = self.unindexed_fixture()
+            fixture.lookup_pages = {
+                None: {"data": [{"id": ROOT}], "$skipToken": "second"},
+                "second": {"data": [], "$skipToken": next_token},
+            }
+            with self.subTest(token=next_token), self.assertRaisesRegex(ERROR, "continuation token"):
+                self.discover(fixture)
+
+    def test_unindexed_lookup_cannot_accept_a_truncated_list_without_continuation(self):
+        for truncated in (True, "true"):
+            fixture = self.unindexed_fixture()
+            fixture.lookup_pages[None]["resultTruncated"] = truncated
+            with self.subTest(truncated=truncated), self.assertRaisesRegex(ERROR, "truncated"):
+                self.discover(fixture)
 
     def test_no_permitted_models_fails_without_defaults(self):
         for entries in ([], [alias(0, "claude-opus-5", allowed=False)]):
