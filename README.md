@@ -79,6 +79,15 @@ under Rosetta:
 bash "$HOME/Downloads/onboard-claude-gateway-macos.sh"
 ```
 
+Compatible Azure CLI installations are reused. If Azure CLI is missing or lacks
+the required tenant-only login option, setup installs or updates the current
+Homebrew cask. An older Homebrew formula is migrated automatically: setup
+refreshes Homebrew metadata and downloads the cask before removing the formula.
+It preserves the Azure CLI sign-in cache and extensions; no manual migration
+commands are required. If replacement installation fails after formula removal,
+setup stops with diagnostics; rerun onboarding to finish installation. Software
+installation changes are not part of client-configuration rollback.
+
 If you saved the file elsewhere, adjust the path.
 
 For either script:

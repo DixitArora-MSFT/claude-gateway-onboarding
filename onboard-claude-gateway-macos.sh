@@ -777,7 +777,8 @@ def find_tool(home, name, minimum=None):
             continue
         arguments = [candidate, "login", "--help"] if name == "az" else [candidate, "--version"]
         result = run(arguments)
-        valid = "--skip-subscription-discovery" in result.stdout if name == "az" else version_tuple(result.stdout) >= minimum
+        valid = ("--skip-subscription-discovery" in result.stdout + result.stderr
+                 if name == "az" else version_tuple(result.stdout) >= minimum)
         if result.returncode == 0 and valid:
             return candidate
     return None
@@ -789,16 +790,26 @@ def brew_install(home, package, cask=False, app=False):
                  if os.path.isfile(path) and os.access(path, os.X_OK)), None)
     if not brew:
         raise SetupError(f"Missing/outdated {package}. Ask IT to install it or provide approved Homebrew. Homebrew will not be installed.")
-    if package == "azure-cli" and not cask:
-        cask_result = run([brew, "list", "--versions", "--cask", package])
-        if cask_result.returncode not in (0, 1):
-            raise SetupError("Cannot inspect the Azure CLI Homebrew cask; ask IT.")
-        cask = cask_result.returncode == 0 and bool(cask_result.stdout.strip())
+    if package == "azure-cli":
+        cask = True
     kind = "--cask" if cask else "--formula"
     installed = run([brew, "list", "--versions", kind, package])
     if installed.returncode not in (0, 1):
         raise SetupError("Cannot inspect Homebrew packages; ask IT to check its installation.")
     operation = "upgrade" if installed.returncode == 0 and installed.stdout.strip() else "install"
+    migrated_formula = False
+    if package == "azure-cli":
+        legacy = run([brew, "list", "--versions", "--formula", package])
+        if legacy.returncode not in (0, 1):
+            raise SetupError("Cannot inspect the legacy Azure CLI Homebrew formula; no formula was removed.")
+        log("Updating Homebrew metadata before installing the current Azure CLI cask.")
+        checked([brew, "update"], timeout=1800, capture=False)
+        if legacy.returncode == 0 and legacy.stdout.strip():
+            log("Migrating the legacy Azure CLI formula to the current cask. Azure sign-in data and extensions will not be deleted.")
+            checked([brew, "fetch", "--cask", package], timeout=1800, capture=False)
+            checked([brew, "uninstall", "--formula", package], timeout=1800, capture=False)
+            migrated_formula = True
+            operation = "reinstall" if operation == "upgrade" else "install"
     arguments = [brew, operation]
     if cask:
         arguments.append("--cask")
@@ -808,7 +819,19 @@ def brew_install(home, package, cask=False, app=False):
         arguments.append("--appdir=" + str(destination))
     arguments.append(package)
     log(f"Using approved Homebrew to {operation} {package}; no force or security-bypass flags are used.")
-    checked(arguments, timeout=1800, capture=False)
+    try:
+        checked(arguments, timeout=1800, capture=False)
+    except SetupError as error:
+        if migrated_formula:
+            raise SetupError("The legacy Azure CLI formula was removed, but the replacement cask installation failed. "
+                             "Azure sign-in data and extensions were not deleted. Rerun onboarding to retry the cask "
+                             "installation; ask IT to resolve the Homebrew error shown above if it persists.") from error
+        raise
+    except KeyboardInterrupt:
+        if migrated_formula:
+            log("Azure CLI migration was interrupted after removing the legacy formula. "
+                "Sign-in data and extensions were not deleted; rerun onboarding to finish installing the cask.")
+        raise
 
 
 def ensure_extension(code):
@@ -829,7 +852,9 @@ def ensure_tools(paths, clients):
         brew_install(paths.home, "azure-cli")
         azure = find_tool(paths.home, "az")
     if not azure:
-        raise SetupError("Azure CLI still lacks tenant-only login support after installation. Ask IT.")
+        raise SetupError("Azure CLI cask installation completed, but no detected az executable supports "
+                         "--skip-subscription-discovery. Ask IT to check the installed az paths and CLI startup errors. "
+                         "Client configuration has not been changed.")
     tools["azure"] = azure
     for client, name, bundle, minimum, package in (
         ("Desktop", "Claude.app", "com.anthropic.claudefordesktop", (1, 8555, 0), "claude"),
