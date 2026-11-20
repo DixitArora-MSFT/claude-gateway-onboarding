@@ -532,7 +532,7 @@ function Ensure-WorkspaceFeature {
     }
 
     $hypervisor = (Get-CimInstance -ClassName Win32_ComputerSystem).HypervisorPresent
-    $architecture = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+    $architecture = Get-WindowsArchitecture
     # ARM64 firmware capabilities are not reliably represented by these x86 WMI fields.
     if (-not $hypervisor -and $architecture -ne 'Arm64') {
         $processors = @(Get-CimInstance -ClassName Win32_Processor)
@@ -1133,6 +1133,18 @@ function Read-HelperSettings {
     return $settings
 }
 
+function Get-WindowsArchitecture {
+    $architectures = @(Get-CimInstance -ClassName Win32_Processor -Property Architecture |
+        Select-Object -ExpandProperty Architecture -Unique)
+    if ($architectures.Count -eq 1) {
+        switch ($architectures[0]) {
+            9 { return 'X64' }
+            12 { return 'Arm64' }
+        }
+    }
+    throw 'Unable to detect a supported x64/ARM64 Windows processor through CIM. Ask IT to check the Windows processor information.'
+}
+
 function Start-DeveloperOnboarding {
     param(
         [Guid]$Tenant,
@@ -1150,7 +1162,7 @@ function Start-DeveloperOnboarding {
     }
 
     $os = Get-CimInstance -ClassName Win32_OperatingSystem
-    $architecture = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+    $architecture = Get-WindowsArchitecture
     if ([int]$os.BuildNumber -lt 19041 -or $architecture -notin @('X64', 'Arm64')) {
         throw 'Claude workspace requires Windows build 19041 or newer and an x64/ARM64 computer.'
     }

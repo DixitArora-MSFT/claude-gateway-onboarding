@@ -22,6 +22,64 @@ function Assert-Fails([scriptblock]$Action, [string]$Message) {
     }
 }
 
+& {
+    function Get-CimInstance {
+        param($ClassName, $Property)
+        Assert-Equal $ClassName 'Win32_Processor' 'Architecture uses Windows processor metadata'
+        Assert-Equal $Property 'Architecture' 'Only processor architecture is requested'
+        return $processorFixture
+    }
+    $processorFixture = @([pscustomobject]@{ Architecture = 9 }, [pscustomobject]@{ Architecture = 9 })
+    Assert-Equal (Get-WindowsArchitecture) 'X64' 'Multiple x64 processors are supported'
+    $oldArchitecture = $env:PROCESSOR_ARCHITECTURE
+    try {
+        $env:PROCESSOR_ARCHITECTURE = 'AMD64'
+        $processorFixture = @([pscustomobject]@{ Architecture = 12 })
+        Assert-Equal (Get-WindowsArchitecture) 'Arm64' 'Native ARM64 detection ignores an emulated process environment'
+    } finally {
+        $env:PROCESSOR_ARCHITECTURE = $oldArchitecture
+    }
+    foreach ($processorFixture in @(
+        @(), @([pscustomobject]@{ Architecture = $null }),
+        @([pscustomobject]@{ Architecture = 0 }), @([pscustomobject]@{ Architecture = 99 }),
+        @([pscustomobject]@{ Architecture = 9 }, [pscustomobject]@{ Architecture = 12 })
+    )) {
+        Assert-Fails { Get-WindowsArchitecture } 'Unable to detect a supported x64/ARM64'
+    }
+    function Get-CimInstance { throw 'offline CIM unavailable' }
+    Assert-Fails { Get-WindowsArchitecture } 'offline CIM unavailable'
+}
+
+& {
+    $nativeArchitecture = 12
+    $hypervisorPresent = $false
+    function Get-CimInstance {
+        param($ClassName, $Property, $Filter)
+        switch ($ClassName) {
+            'Win32_OptionalFeature' {
+                Assert-Equal $Filter "Name='VirtualMachinePlatform'" 'Only Virtual Machine Platform is checked'
+                return [pscustomobject]@{ InstallState = 1 }
+            }
+            'Win32_ComputerSystem' { return [pscustomobject]@{ HypervisorPresent = $hypervisorPresent } }
+            'Win32_Processor' {
+                return [pscustomobject]@{
+                    Architecture = $nativeArchitecture
+                    VirtualizationFirmwareEnabled = $false
+                }
+            }
+            default { throw "Unexpected CIM class: $ClassName" }
+        }
+    }
+    function Start-Process { throw 'Offline workspace checks must not enable Windows features' }
+    Assert-Equal (Ensure-WorkspaceFeature).RestartNeeded $true 'ARM64 does not rely on x86 firmware fields'
+    $nativeArchitecture = 9
+    Assert-Fails { Ensure-WorkspaceFeature } 'Hardware virtualization is not reported as enabled'
+    $hypervisorPresent = $true
+    Assert-Equal (Ensure-WorkspaceFeature).RestartNeeded $false 'Running x64 hypervisor needs no restart'
+    $nativeArchitecture = 12
+    Assert-Equal (Ensure-WorkspaceFeature).RestartNeeded $false 'Running ARM64 hypervisor needs no restart'
+}
+
 $script:root = '/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/demo/providers/Microsoft.ApiManagement/aigateways/example'
 $script:scope = "$root/workspaces/default"
 $script:hostUrl = 'https://example.ai.gateway.azure.com'
