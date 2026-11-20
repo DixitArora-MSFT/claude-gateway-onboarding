@@ -1,9 +1,11 @@
 import copy
+import contextlib
 import json
 from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -79,6 +81,71 @@ class CatalogFixture:
 
 
 class GatewayDiscoveryTests(unittest.TestCase):
+    def test_setup_and_rerun_for_each_client_without_live_commands_or_inference(self):
+        for selection in ("Desktop", "CLI", "VSCode", "All"):
+            with self.subTest(selection=selection), tempfile.TemporaryDirectory(prefix="claude-mac-flows-") as directory:
+                paths = MODULE["Paths"](Path(directory))
+                cache = paths.home / "custom Azure cache"
+                options = SimpleNamespace(client=selection, tenant_id=SETTINGS["TenantId"],
+                                          gateway_base_url=ORIGIN, verify_models=False)
+                commands = []
+
+                def token(settings, interactive):
+                    self.assertTrue(interactive)
+                    self.assertEqual(settings["AzureConfigDir"], str(cache))
+                    return "offline-token"
+
+                def tools(paths, clients):
+                    return {"azure": "offline-az", **{client: paths.home / (client + ".app") for client in clients}}
+
+                def checked(arguments, **kwargs):
+                    self.assertEqual(arguments, ["/usr/bin/open", str(paths.home / "Desktop.app")])
+                    commands.append(arguments)
+                    return subprocess.CompletedProcess(arguments, 0, "", "")
+
+                def forbidden(*args, **kwargs):
+                    self.fail("Offline onboarding must never invoke tools or a model")
+
+                original_write, original_state = MODULE["atomic_write"], MODULE["file_state"]
+                modes = {}
+
+                def atomic_write(path, data, mode):
+                    original_write(path, data, mode)
+                    modes[path] = mode
+
+                def file_state(path):
+                    state = original_state(path)
+                    # Windows cannot represent POSIX execute bits; keep real file I/O and emulate only modes.
+                    if state is not None and MODULE["os"].name == "nt":
+                        return state[0], modes.get(path, state[1])
+                    return state
+
+                with patch.dict(MODULE["os"].environ, {"AZURE_CONFIG_DIR": str(cache)}, clear=True), patch.dict(MODULE, {
+                        "onboarding_lock": lambda root: contextlib.nullcontext(),
+                        "check_managed": lambda *a: None, "wait_for_clients": lambda *a: None,
+                        "ensure_tools": tools, "get_token": token,
+                        "discover_models": lambda settings: [{"Alias": "provider/claude-sonnet-5", "ModelNames": ["claude-sonnet-5"]}],
+                        "checked": checked, "run": forbidden, "verify_models": forbidden, "log": lambda message: None,
+                        "atomic_write": atomic_write, "file_state": file_state,
+                }):
+                    for iteration in range(2):
+                        self.assertEqual(MODULE["onboard"](options, SOURCE, paths), 0)
+                        saved_paths = list(paths.root.glob("*/gateway-settings.json"))
+                        self.assertEqual(len(saved_paths), 1)
+                        saved = json.loads(saved_paths[0].read_bytes())
+                        self.assertEqual(saved["AzureConfigDir"], str(cache))
+                        if iteration:
+                            self.assertEqual(saved["ConfigId"], config_id)
+                        config_id = saved["ConfigId"]
+                        if selection in ("Desktop", "All"):
+                            meta = json.loads((paths.desktop / "_meta.json").read_bytes())
+                            self.assertEqual(len(meta["entries"]), 1)
+                            self.assertEqual(meta["appliedId"], config_id)
+                        self.assertEqual(paths.code.exists(), selection != "Desktop")
+                        if paths.code.exists():
+                            self.assertEqual(json.loads(paths.code.read_bytes())["availableModels"], ["provider/claude-sonnet-5"])
+                self.assertEqual(len(commands), 2 if selection in ("Desktop", "All") else 0)
+
     def test_runtime_url_and_full_anthropic_url_normalize_identically(self):
         for url in (ORIGIN, ORIGIN + "/", SETTINGS["GatewayBaseUrl"], SETTINGS["GatewayBaseUrl"] + "/"):
             with self.subTest(url=url):

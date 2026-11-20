@@ -52,6 +52,20 @@ class HomebrewFixture:
 
 
 class MacPrerequisiteTests(unittest.TestCase):
+    def test_running_clients_detects_versioned_native_cli_without_other_users_or_desktop(self):
+        uid = 501
+        native = "/Users/demo/.local/share/claude/versions/2.1.246"
+        symlink = "/Users/demo/.local/bin/claude"
+        desktop = "/Applications/Claude.app/Contents/MacOS/Claude"
+        output = (f"{uid} {native}\n{uid} {symlink}\n{uid} {desktop}\n"
+                  f"502 {native}\n{uid} /usr/local/bin/unrelated\n")
+        with patch.object(MODULE["os"], "getuid", return_value=uid, create=True), patch.dict(MODULE, {
+                "checked": lambda *a, **k: subprocess.CompletedProcess([], 0, output, ""),
+        }):
+            self.assertEqual(MODULE["running_clients"]({"CLI"}), [native, symlink])
+            self.assertEqual(MODULE["running_clients"]({"Desktop"}), [desktop])
+            self.assertEqual(MODULE["running_clients"]({"VSCode"}), [])
+
     def brew_patches(self, fixture):
         return patch.multiple(
             MODULE["shutil"], which=lambda name: BREW if name == "brew" else None,

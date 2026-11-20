@@ -240,11 +240,13 @@ function Resolve-GatewayResource {
 function Get-GatewayModelCatalog {
     param($Settings)
 
-    $result = Invoke-NativeCapture -FilePath $Settings.AzureCliPath -Arguments @(
-        'account', 'get-access-token', '--tenant', $Settings.TenantId,
-        '--resource', 'https://management.azure.com', '--query', 'accessToken',
-        '--output', 'tsv', '--only-show-errors'
-    )
+    $result = Invoke-WithAzureConfig -Settings $Settings -Action {
+        Invoke-NativeCapture -FilePath $Settings.AzureCliPath -Arguments @(
+            'account', 'get-access-token', '--tenant', $Settings.TenantId,
+            '--resource', 'https://management.azure.com', '--query', 'accessToken',
+            '--output', 'tsv', '--only-show-errors'
+        )
+    }
     if ($result.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($result.Output)) {
         throw 'Cannot acquire an Azure management token for automatic model discovery. Check sign-in and gateway catalog read access.'
     }
@@ -584,14 +586,36 @@ try {
     }
 }
 
+function Invoke-WithAzureConfig {
+    param($Settings, [scriptblock]$Action)
+
+    $previous = $env:AZURE_CONFIG_DIR
+    try {
+        if ($Settings.PSObject.Properties['AzureConfigDir']) {
+            $cache = $Settings.AzureConfigDir
+            if ($cache -isnot [string] -or [string]::IsNullOrWhiteSpace($cache) -or
+                -not [IO.Path]::IsPathRooted($cache) -or [IO.Path]::GetPathRoot($cache) -in @('\', '/')) {
+                throw 'The saved Azure CLI cache directory must be an absolute path; rerun onboarding.'
+            }
+            $env:AZURE_CONFIG_DIR = $cache
+        }
+        & $Action
+    }
+    finally {
+        $env:AZURE_CONFIG_DIR = $previous
+    }
+}
+
 function Get-GatewayTokenResult {
     param($Settings)
 
-    Invoke-NativeCapture -FilePath $Settings.AzureCliPath -Arguments @(
-        'account', 'get-access-token', '--tenant', $Settings.TenantId,
-        '--scope', 'https://azure-api.net/aigateway/Data.All',
-        '--query', 'accessToken', '--output', 'tsv', '--only-show-errors'
-    )
+    Invoke-WithAzureConfig -Settings $Settings -Action {
+        Invoke-NativeCapture -FilePath $Settings.AzureCliPath -Arguments @(
+            'account', 'get-access-token', '--tenant', $Settings.TenantId,
+            '--scope', 'https://azure-api.net/aigateway/Data.All',
+            '--query', 'accessToken', '--output', 'tsv', '--only-show-errors'
+        )
+    }
 }
 
 function Start-EntraSignIn {
@@ -602,8 +626,10 @@ function Start-EntraSignIn {
     [Console]::Error.WriteLine('Complete Microsoft sign-in in the Azure CLI window that opens.')
     $command = "`$global:LASTEXITCODE = `$null; & '$cli' login --tenant $tenant --allow-no-subscriptions --skip-subscription-discovery --scope https://azure-api.net/aigateway/Data.All --output none; if (`$null -eq `$global:LASTEXITCODE) { exit 1 }; exit `$global:LASTEXITCODE"
     $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
-    $process = Start-Process -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
-        -ArgumentList @('-NoLogo', '-NoProfile', '-EncodedCommand', $encoded) -WindowStyle Normal -PassThru -Wait
+    $process = Invoke-WithAzureConfig -Settings $Settings -Action {
+        Start-Process -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
+            -ArgumentList @('-NoLogo', '-NoProfile', '-EncodedCommand', $encoded) -WindowStyle Normal -PassThru -Wait
+    }
     if ($process.ExitCode -ne 0) {
         throw "Entra sign-in was cancelled or failed (exit $($process.ExitCode))."
     }
@@ -618,7 +644,7 @@ function Get-EntraCredential {
     for ($attempt = 0; $attempt -lt 2; $attempt++) {
         $result = Get-GatewayTokenResult -Settings $Settings
         if ($result.ExitCode -ne 0) {
-            $needsSignIn = $result.Output -match '(?i)AADSTS(?:50058|50076|50079|50173|70043|700082|700084|70008)\b|interaction_required|please run[^\r\n]*az login|not logged in|tenant[^\r\n]*not found in cloud'
+            $needsSignIn = $result.Output -match '(?i)AADSTS(?:50058|50076|50079|50173|65001|70043|700082|700084|70008)\b|interaction_required|please run[^\r\n]*az login|not logged in|tenant[^\r\n]*not found in cloud'
             if ($needsSignIn -and $Context -eq 'interactive' -and $attempt -eq 0) {
                 Start-EntraSignIn -Settings $Settings
                 continue
@@ -845,12 +871,28 @@ exit /b %errorlevel%
     return [pscustomobject]@{ Desktop = $helperPath; Code = $codeHelperPath }
 }
 
+function Assert-DesktopSettingsCompatible {
+    param($Settings)
+
+    if ($Settings.PSObject.Properties['inferenceCustomHeaders']) {
+        $headers = $Settings.inferenceCustomHeaders
+        if ($headers -isnot [pscustomobject] -or @($headers.PSObject.Properties | Where-Object {
+            $_.Name -in @('Authorization', 'api-key', 'x-api-key')
+        }).Count) {
+            throw 'Resolve credential headers in the saved Desktop configuration before onboarding.'
+        }
+    }
+}
+
 function Install-DesktopConfiguration {
     param($Settings, [string]$InstallRoot, [string]$HelperPath, [string]$ConfigDirectory)
 
     [IO.Directory]::CreateDirectory($ConfigDirectory) | Out-Null
     $configPath = Join-Path $ConfigDirectory ($Settings.ConfigId + '.json')
     $config = Read-JsonSettings -Path $configPath
+    Assert-DesktopSettingsCompatible -Settings $config
+    $config.PSObject.Properties.Remove('inferenceCredentialHelperWindows')
+    $config.PSObject.Properties.Remove('inferenceCredentialHelperArgs')
     $gatewayValues = [ordered]@{
         inferenceProvider = 'gateway'
         inferenceGatewayBaseUrl = $Settings.GatewayBaseUrl
@@ -1225,7 +1267,8 @@ function Start-DeveloperOnboarding {
         if (Test-Path -LiteralPath $metaPath) {
             Read-DesktopMetadata -Path $metaPath | Out-Null
         }
-        Read-JsonSettings -Path (Join-Path $configDirectory ($configId + '.json')) | Out-Null
+        $desktopSettings = Read-JsonSettings -Path (Join-Path $configDirectory ($configId + '.json'))
+        Assert-DesktopSettingsCompatible -Settings $desktopSettings
     }
 
     if ($useVSCode -and $env:TERM_PROGRAM -eq 'vscode') {
@@ -1233,12 +1276,18 @@ function Start-DeveloperOnboarding {
     }
     Write-Host 'Checking and installing developer prerequisites...'
     $azureCli = Ensure-AzureCli -Architecture $architecture -WindowsBuild ([int]$os.BuildNumber)
+    $azureCache = if ([string]::IsNullOrWhiteSpace($env:AZURE_CONFIG_DIR)) {
+        Join-Path $env:USERPROFILE '.azure'
+    } else {
+        [IO.Path]::GetFullPath($env:AZURE_CONFIG_DIR)
+    }
     $settings = [pscustomobject]@{
         TenantId = $Tenant.ToString()
         GatewayBaseUrl = $BaseUrl.TrimEnd('/')
         Models = @()
         ModelMapping = $null
         AzureCliPath = $azureCli
+        AzureConfigDir = $azureCache
         ConfigId = $configId
     }
     Write-Host 'Checking your Entra sign-in. Complete Microsoft sign-in if prompted.'

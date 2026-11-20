@@ -10,6 +10,7 @@ $functions = $ast.EndBlock.Statements | Where-Object {
 }
 . ([scriptblock]::Create(($functions | ForEach-Object { $_.Extent.Text }) -join "`n"))
 $originalRequest = (Get-Item Function:\Invoke-GatewayCatalogRequest).ScriptBlock
+$originalNativeCapture = (Get-Item Function:\Invoke-NativeCapture).ScriptBlock
 
 function Assert-Equal($Actual, $Expected, $Message) {
     if ($Actual -cne $Expected) { throw "$Message`: expected '$Expected', got '$Actual'." }
@@ -80,6 +81,68 @@ function Assert-Fails([scriptblock]$Action, [string]$Message) {
     Assert-Equal (Ensure-WorkspaceFeature).RestartNeeded $false 'Running ARM64 hypervisor needs no restart'
 }
 
+& {
+    $claims = @{ tid = '22222222-2222-2222-2222-222222222222'; aud = 'https://azure-api.net/aigateway';
+        scp = 'Data.All'; exp = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + 3600 }
+    $payload = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($claims | ConvertTo-Json -Compress))).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+    $validToken = 'header.' + $payload + '.signature'
+    $credentialSettings = [pscustomobject]@{ TenantId = $claims.tid }
+    function Get-GatewayTokenResult {
+        if ($script:offlineSignIns -gt 0) { return [pscustomobject]@{ ExitCode = 0; Output = $validToken } }
+        return [pscustomobject]@{ ExitCode = 1; Output = "AADSTS${code}: offline sign-in required" }
+    }
+    function Start-EntraSignIn { $script:offlineSignIns++ }
+    foreach ($code in @('65001', '50076')) {
+        $script:offlineSignIns = 0
+        Assert-Equal (Get-EntraCredential -Settings $credentialSettings -Context interactive).token $validToken 'Interactive consent/MFA recovers once'
+        Assert-Equal $script:offlineSignIns 1 'Exactly one interactive sign-in'
+        $script:offlineSignIns = 0
+        Assert-Fails { Get-EntraCredential -Settings $credentialSettings -Context background } 'Gateway token acquisition failed'
+        Assert-Equal $script:offlineSignIns 0 'Background helper never opens sign-in'
+    }
+    $code = '700016'
+    $script:offlineSignIns = 0
+    Assert-Fails { Get-EntraCredential -Settings $credentialSettings -Context interactive } 'Gateway token acquisition failed'
+    Assert-Equal $script:offlineSignIns 0 'Nonrecoverable failures do not open sign-in'
+}
+
+& {
+    $previousCache = $env:AZURE_CONFIG_DIR
+    $expectedCache = Join-Path ([IO.Path]::GetTempPath()) 'offline saved Azure cache'
+    $credentialSettings = [pscustomobject]@{
+        TenantId = '22222222-2222-2222-2222-222222222222'; AzureCliPath = 'offline-az'; AzureConfigDir = $expectedCache
+    }
+    function Invoke-NativeCapture {
+        param($FilePath, $Arguments)
+        Assert-Equal $env:AZURE_CONFIG_DIR $expectedCache 'Token uses saved Azure cache'
+        return [pscustomobject]@{ ExitCode = 0; Output = 'offline-token' }
+    }
+    function Start-Process {
+        Assert-Equal $env:AZURE_CONFIG_DIR $expectedCache 'Sign-in child inherits saved Azure cache'
+        return [pscustomobject]@{ ExitCode = 0 }
+    }
+    try {
+        $env:AZURE_CONFIG_DIR = 'offline inherited cache'
+        Assert-Equal (Get-GatewayTokenResult -Settings $credentialSettings).Output 'offline-token' 'Token lookup succeeds'
+        Assert-Equal $env:AZURE_CONFIG_DIR 'offline inherited cache' 'Token lookup restores caller environment'
+        Start-EntraSignIn -Settings $credentialSettings
+        Assert-Equal $env:AZURE_CONFIG_DIR 'offline inherited cache' 'Sign-in restores caller environment'
+        Assert-Fails {
+            Invoke-WithAzureConfig -Settings $credentialSettings -Action { throw 'offline Azure failure' }
+        } 'offline Azure failure'
+        Assert-Equal $env:AZURE_CONFIG_DIR 'offline inherited cache' 'Failed commands restore caller environment'
+        foreach ($invalidCache in @('relative-cache', '\root-relative', '', $null, 123)) {
+            $credentialSettings.AzureConfigDir = $invalidCache
+            Assert-Fails { Get-GatewayTokenResult -Settings $credentialSettings } 'must be an absolute path'
+        }
+        $credentialSettings.PSObject.Properties.Remove('AzureConfigDir')
+        Assert-Equal (Invoke-WithAzureConfig -Settings $credentialSettings -Action { $env:AZURE_CONFIG_DIR }) `
+            'offline inherited cache' 'Older helper settings retain inherited cache behavior'
+    } finally {
+        $env:AZURE_CONFIG_DIR = $previousCache
+    }
+}
+
 $script:root = '/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/demo/providers/Microsoft.ApiManagement/aigateways/example'
 $script:scope = "$root/workspaces/default"
 $script:hostUrl = 'https://example.ai.gateway.azure.com'
@@ -87,6 +150,7 @@ $settings = [pscustomobject]@{
     TenantId = '22222222-2222-2222-2222-222222222222'
     GatewayBaseUrl = "$hostUrl/default/models/anthropic"
     AzureCliPath = 'az'
+    AzureConfigDir = Join-Path ([IO.Path]::GetTempPath()) 'offline catalog cache'
 }
 foreach ($url in @($hostUrl, "$hostUrl/", $settings.GatewayBaseUrl, ($settings.GatewayBaseUrl + '/'))) {
     Assert-Equal (Resolve-GatewayBaseUrl $url) $settings.GatewayBaseUrl 'Runtime URL normalization'
@@ -111,6 +175,7 @@ function New-TestAlias([int]$Number, [string]$Model, [string]$Alias, [bool]$Allo
 }
 function Invoke-NativeCapture {
     param($FilePath, $Arguments)
+    Assert-Equal $env:AZURE_CONFIG_DIR $settings.AzureConfigDir 'Catalog uses saved Azure cache'
     if ($Arguments -notcontains 'https://management.azure.com' -or $Arguments -notcontains $settings.TenantId) {
         throw 'Discovery must request an Azure management token in the supplied tenant.'
     }
@@ -427,11 +492,53 @@ try {
     $conflicting.env.PSObject.Properties.Remove('ANTHROPIC_AUTH_TOKEN')
     Write-JsonFile -Path $cliPath -Value $conflicting
     $settings | Add-Member ConfigId ([Guid]::NewGuid().ToString())
+    $claims = @{ tid = $settings.TenantId; aud = 'https://azure-api.net/aigateway';
+        scp = 'Data.All'; exp = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + 3600 }
+    $payload = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($claims | ConvertTo-Json -Compress))).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+    $helperToken = 'header.' + $payload + '.signature'
+    $fakeCli = Join-Path $temp 'offline azure.cmd'
+    $fakeCommand = "@echo off`r`nif not `"%AZURE_CONFIG_DIR%`"==`"$($settings.AzureConfigDir)`" exit /b 19`r`necho $helperToken`r`nexit /b 0`r`n"
+    [IO.File]::WriteAllText($fakeCli, $fakeCommand, [Text.Encoding]::ASCII)
+    $helperSettings = [pscustomobject]@{
+        TenantId = $settings.TenantId; GatewayBaseUrl = $settings.GatewayBaseUrl;
+        AzureCliPath = $fakeCli; AzureConfigDir = $settings.AzureConfigDir; ConfigId = $settings.ConfigId
+    }
+    $helpers = Install-GatewayHelpers -Settings $helperSettings -InstallRoot (Join-Path $temp 'helpers with spaces') `
+        -ScriptPath (Join-Path $repo 'onboard-claude-gateway.ps1')
+    $desktopResult = & $originalNativeCapture -FilePath $helpers.Desktop -Arguments @()
+    Assert-Equal $desktopResult.ExitCode 0 'Generated Desktop helper executes successfully'
+    Assert-Equal ($desktopResult.Output | ConvertFrom-Json).token $helperToken 'Desktop helper returns JSON only'
+    $codeResult = & $originalNativeCapture -FilePath $helpers.Code -Arguments @()
+    Assert-Equal $codeResult.ExitCode 0 'Generated Code helper executes successfully'
+    Assert-Equal $codeResult.Output $helperToken 'Code helper returns only the token'
     $desktopDir = Join-Path $temp 'desktop'
     Install-DesktopConfiguration -Settings $settings -InstallRoot $installRoot `
         -HelperPath 'C:\helpers\token.cmd' -ConfigDirectory $desktopDir | Out-Null
     $desktop = Read-JsonSettings -Path (Join-Path $desktopDir ($settings.ConfigId + '.json'))
     Assert-Equal ($desktop.inferenceModels.name -join ',') ($settings.Models -join ',') 'Desktop model list'
+    $desktop | Add-Member inferenceCredentialHelperWindows 'C:\old-helper.cmd'
+    $desktop | Add-Member inferenceCredentialHelperArgs @('--old-argument')
+    $desktop | Add-Member inferenceCustomHeaders ([pscustomobject]@{ 'X-Routing' = 'preserved' })
+    $desktopPath = Join-Path $desktopDir ($settings.ConfigId + '.json')
+    Write-JsonFile -Path $desktopPath -Value $desktop
+    Install-DesktopConfiguration -Settings $settings -InstallRoot $installRoot `
+        -HelperPath 'C:\helpers\new-token.cmd' -ConfigDirectory $desktopDir | Out-Null
+    $desktop = Read-JsonSettings -Path $desktopPath
+    Assert-Equal $desktop.inferenceCredentialHelperWindows $null 'Stale Windows helper override removed'
+    Assert-Equal $desktop.inferenceCredentialHelperArgs $null 'Old helper arguments removed'
+    Assert-Equal $desktop.inferenceCredentialHelper 'C:\helpers\new-token.cmd' 'New helper is the effective Windows helper'
+    Assert-Equal $desktop.inferenceCustomHeaders.'X-Routing' 'preserved' 'Routing headers preserved'
+    foreach ($header in @('Authorization', 'API-Key', 'x-api-key')) {
+        $desktop.inferenceCustomHeaders | Add-Member -NotePropertyName $header -NotePropertyValue 'offline-credential'
+        Write-JsonFile -Path $desktopPath -Value $desktop
+        $beforeHeaders = [Convert]::ToBase64String([IO.File]::ReadAllBytes($desktopPath))
+        Assert-Fails {
+            Install-DesktopConfiguration -Settings $settings -InstallRoot $installRoot `
+                -HelperPath 'C:\helpers\new-token.cmd' -ConfigDirectory $desktopDir
+        } 'Resolve credential headers'
+        Assert-Equal ([Convert]::ToBase64String([IO.File]::ReadAllBytes($desktopPath))) $beforeHeaders 'Conflicting Desktop settings are not modified'
+        $desktop.inferenceCustomHeaders.PSObject.Properties.Remove($header)
+    }
     $settings.Models = @('provider/claude-opus-4-5', 'provider/claude-opus-5')
     $settings.ModelMapping = [ordered]@{ Opus = $settings.Models[0] }
     Install-CodeConfiguration -Settings $settings -InstallRoot $installRoot -HelperPath 'C:\helpers\token.cmd'
@@ -443,4 +550,92 @@ finally {
     $env:APPDATA = $oldAppData
     if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Recurse -Force }
 }
-Write-Output 'Windows discovery, RBAC, mapping, client configuration, and direct Foundry migration checks passed.'
+& {
+    $flowRoot = Join-Path ([IO.Path]::GetTempPath()) ('claude-onboarding-flows-' + [Guid]::NewGuid())
+    $oldProfile = $env:USERPROFILE
+    $oldAppData = $env:APPDATA
+    $oldLocalAppData = $env:LOCALAPPDATA
+    $oldAzureCache = $env:AZURE_CONFIG_DIR
+    $oldTerminal = $env:TERM_PROGRAM
+    function Get-CimInstance {
+        param($ClassName, $Property, $Filter)
+        switch ($ClassName) {
+            'Win32_OperatingSystem' { return [pscustomobject]@{ BuildNumber = 22631 } }
+            'Win32_Processor' { return [pscustomobject]@{ Architecture = 12 } }
+            'Win32_OptionalFeature' { return [pscustomobject]@{ InstallState = 1 } }
+            'Win32_ComputerSystem' { return [pscustomobject]@{ HypervisorPresent = $true } }
+            default { throw "Unexpected CIM request: $ClassName" }
+        }
+    }
+    function Assert-NoManagedInferencePolicy {}
+    function Assert-NoManagedCodePolicy {}
+    function Ensure-AzureCli { return 'offline-az' }
+    function Get-EntraCredential {
+        param($Settings, $Context)
+        Assert-Equal $Settings.AzureConfigDir $expectedCache 'Onboarding records the correct Azure cache'
+        return @{ token = 'offline-token' }
+    }
+    function Get-GatewayModelCatalog {
+        return [pscustomobject]@{ Alias = 'provider/claude-sonnet-5'; ModelNames = @('claude-sonnet-5') }
+    }
+    function Ensure-ClaudeDesktop { return [pscustomobject]@{ PackageFullName = 'offline-package'; PackageFamilyName = 'offline-family' } }
+    function Get-AppxPackageManifest {
+        return [pscustomobject]@{ Package = [pscustomobject]@{ Applications = [pscustomobject]@{
+            Application = @([pscustomobject]@{ Executable = 'Claude.exe'; Id = 'Claude' })
+        } } }
+    }
+    function Ensure-CodeClient { param($Name); return "C:\offline\$Name.exe" }
+    function Ensure-ClaudeCodeExtension {}
+    function Wait-ForClaudeToClose {}
+    function Wait-ForCodeClientsToClose {}
+    function Start-Process {
+        param($FilePath, $ArgumentList)
+        Assert-Equal $FilePath 'explorer.exe' 'Only the final Desktop launch is requested'
+    }
+    function Install-WinGetPackage { throw 'Offline flows must never install software' }
+    function Invoke-WebRequest { throw 'Offline flows must never call a model or management endpoint' }
+    function Invoke-NativeCapture { throw 'Offline flows must never launch Azure CLI' }
+    try {
+        $env:TERM_PROGRAM = $null
+        foreach ($selection in @('Desktop', 'CLI', 'VSCode', 'All')) {
+            $flowHome = Join-Path $flowRoot $selection
+            $env:USERPROFILE = $flowHome
+            $env:APPDATA = Join-Path $flowHome 'AppData\Roaming'
+            $env:LOCALAPPDATA = Join-Path $flowHome 'AppData\Local'
+            $expectedCache = if ($selection -eq 'Desktop') { Join-Path $flowHome '.azure' } else { Join-Path $flowHome 'custom Azure cache' }
+            $env:AZURE_CONFIG_DIR = if ($selection -eq 'Desktop') { $null } else { $expectedCache }
+            $clients = @(Resolve-OnboardingClients -Selection $selection)
+            $configId = $null
+            foreach ($run in @(1, 2)) {
+                $exitCode = Start-DeveloperOnboarding -Tenant ([Guid]'22222222-2222-2222-2222-222222222222') `
+                    -BaseUrl 'https://example.ai.gateway.azure.com' -SourceScript (Join-Path $repo 'onboard-claude-gateway.ps1') `
+                    -Clients $clients 6>$null
+                Assert-Equal $exitCode 0 "$selection setup/rerun succeeds"
+                $savedPath = @(Get-ChildItem -LiteralPath (Join-Path $env:LOCALAPPDATA 'ClaudeGatewayEntra') -Filter 'gateway-settings.json' -Recurse)
+                Assert-Equal $savedPath.Count 1 'One helper configuration per tenant and endpoint'
+                $saved = Read-JsonSettings -Path $savedPath[0].FullName
+                Assert-Equal $saved.AzureConfigDir $expectedCache 'Helper persists default/custom Azure cache'
+                if ($configId) { Assert-Equal $saved.ConfigId $configId 'Rerun retains existing configuration ID' }
+                $configId = $saved.ConfigId
+                if ($clients -contains 'Desktop') {
+                    $meta = Read-DesktopMetadata -Path (Join-Path $env:LOCALAPPDATA 'Claude-3p\configLibrary\_meta.json')
+                    Assert-Equal $meta.entries.Count 1 'Rerun does not duplicate Desktop configuration'
+                    Assert-Equal $meta.appliedId $configId 'Expected Desktop configuration is active'
+                }
+                $codePath = Join-Path $flowHome '.claude\settings.json'
+                Assert-Equal (Test-Path -LiteralPath $codePath) ($selection -ne 'Desktop') 'Desktop-only leaves Code settings untouched'
+                if ($selection -ne 'Desktop') {
+                    Assert-Equal (Read-JsonSettings -Path $codePath).availableModels[0] 'provider/claude-sonnet-5' 'Code flow saves discovered model'
+                }
+            }
+        }
+    } finally {
+        $env:USERPROFILE = $oldProfile
+        $env:APPDATA = $oldAppData
+        $env:LOCALAPPDATA = $oldLocalAppData
+        $env:AZURE_CONFIG_DIR = $oldAzureCache
+        $env:TERM_PROGRAM = $oldTerminal
+        if (Test-Path -LiteralPath $flowRoot) { Remove-Item -LiteralPath $flowRoot -Recurse -Force }
+    }
+}
+Write-Output 'Windows authentication, cache, discovery, configuration, rollback, and setup/rerun flow checks passed.'

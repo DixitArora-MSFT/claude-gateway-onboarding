@@ -946,9 +946,11 @@ def running_clients(clients):
         if len(parts) != 2 or parts[0] != str(os.getuid()):
             continue
         command = parts[1]
+        native_cli = (Path(command).name == "claude" or
+                      re.search(r"/\.local/share/claude/versions/[^/]+$", command) is not None)
         if (("Desktop" in clients and "/Claude.app/Contents/" in command) or
                 ("VSCode" in clients and "/Visual Studio Code.app/Contents/" in command) or
-                ("CLI" in clients and Path(command).name == "claude" and "/Claude.app/" not in command)):
+                ("CLI" in clients and native_cli and "/Claude.app/" not in command)):
             matches.append(command)
     return matches
 
