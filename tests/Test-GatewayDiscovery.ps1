@@ -143,6 +143,58 @@ function Assert-Fails([scriptblock]$Action, [string]$Message) {
     }
 }
 
+& {
+    $currentPackage = [pscustomobject]@{ Version = '6.6395.0'; PackageFullName = 'offline-current-msix' }
+    $oldPackage = [pscustomobject]@{ Version = '1.8000.0'; PackageFullName = 'offline-old-msix' }
+    $cases = @(
+        @{ Name = 'Healthy rerun'; Packages = @($currentPackage); Calls = 0 },
+        @{ Name = 'First installation'; Packages = @($null, $currentPackage); Calls = 1 },
+        @{ Name = 'Normal update'; Packages = @($oldPackage, $currentPackage); Calls = 1 },
+        @{ Name = 'Existing non-MSIX installation'; Packages = @($null, $null, $currentPackage); Calls = 2 },
+        @{ Name = 'Old MSIX not updated'; Packages = @($oldPackage, $oldPackage, $currentPackage); Calls = 2 },
+        @{ Name = 'Missing registration after repair'; Packages = @($null, $null, $null); Calls = 2;
+            Failure = 'MSIX is not registered' },
+        @{ Name = 'Old version after repair'; Packages = @($oldPackage, $oldPackage, $oldPackage); Calls = 2;
+            Failure = 'version 1.8555.0.0 or newer is required' },
+        @{ Name = 'Installer failure'; Packages = @($null); Calls = 1; FailAt = 1;
+            Failure = 'offline installer failure' },
+        @{ Name = 'Repair installer failure'; Packages = @($null, $null); Calls = 2; FailAt = 2;
+            Failure = 'offline installer failure' }
+    )
+    function Get-ClaudePackage { return $case.Packages[$installCalls.Count] }
+    function Get-WinGetPath { return 'offline-winget' }
+    function Invoke-NativeCapture {
+        param($FilePath, $Arguments)
+        Assert-Equal $FilePath 'offline-winget' 'Desktop uses the mocked installer'
+        Assert-Equal ($Arguments -contains 'Anthropic.Claude') $true 'Repair targets only Claude Desktop'
+        Assert-Equal $Arguments[[Array]::IndexOf($Arguments, '--installer-type') + 1] 'msix' 'MSIX is explicitly selected'
+        Assert-Equal $Arguments[[Array]::IndexOf($Arguments, '--architecture') + 1] `
+            $architecture.ToLowerInvariant() 'Installer uses the native architecture'
+        Assert-Equal ($Arguments -contains '--force') ($installCalls.Count -eq 1) 'Only the bounded repair is forced'
+        $installCalls.Add([pscustomobject]@{ Arguments = @($Arguments) })
+        if ($case.FailAt -eq $installCalls.Count) {
+            return [pscustomobject]@{ ExitCode = 1603; Output = 'offline installer failure' }
+        }
+        return [pscustomobject]@{ ExitCode = 0x8A15002B; Output = 'Already installed; no applicable update' }
+    }
+    foreach ($architecture in @('X64', 'Arm64')) {
+        foreach ($case in $cases) {
+            $installCalls = New-Object 'Collections.Generic.List[object]'
+            if ($case.Failure) {
+                Assert-Fails { Ensure-ClaudeDesktop -Architecture $architecture } $case.Failure
+            } else {
+                Assert-Equal (Ensure-ClaudeDesktop -Architecture $architecture).PackageFullName `
+                    $currentPackage.PackageFullName "$($case.Name): returns the verified MSIX"
+                if ($case.Calls -eq 2) {
+                    Assert-Equal (Ensure-ClaudeDesktop -Architecture $architecture).PackageFullName `
+                        $currentPackage.PackageFullName 'Repaired installation is reused on rerun'
+                }
+            }
+            Assert-Equal $installCalls.Count $case.Calls "$($case.Name): installation attempts are bounded"
+        }
+    }
+}
+
 $script:root = '/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/demo/providers/Microsoft.ApiManagement/aigateways/example'
 $script:scope = "$root/workspaces/default"
 $script:hostUrl = 'https://example.ai.gateway.azure.com'

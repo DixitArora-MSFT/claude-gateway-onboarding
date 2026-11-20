@@ -444,13 +444,19 @@ function Ensure-ClaudeDesktop {
 
     $package = Get-ClaudePackage
     if (-not $package -or [Version]$package.Version -lt [Version]'1.8555.0.0') {
-        Install-WinGetPackage -PackageId Anthropic.Claude -AdditionalArguments @(
+        $installerArguments = @(
             '--installer-type', 'msix', '--architecture', $Architecture.ToLowerInvariant()
         )
+        Install-WinGetPackage -PackageId Anthropic.Claude -AdditionalArguments $installerArguments
         $package = Get-ClaudePackage
+        if (-not $package -or [Version]$package.Version -lt [Version]'1.8555.0.0') {
+            Write-Host 'The required Claude Desktop MSIX is still missing or outdated. Retrying once with an explicit forced MSIX installation for this Windows account.'
+            Install-WinGetPackage -PackageId Anthropic.Claude -AdditionalArguments ($installerArguments + @('--force'))
+            $package = Get-ClaudePackage
+        }
     }
     if (-not $package) {
-        throw 'Claude Desktop MSIX is not registered for this Windows account after installation.'
+        throw 'Claude Desktop MSIX is not registered for this Windows account after installation and one repair attempt. Run onboarding as the Windows user who will use Claude. Ask IT to check MSIX installation policy and registration.'
     }
     if ([Version]$package.Version -lt [Version]'1.8555.0.0') {
         throw 'Claude Desktop MSIX version 1.8555.0.0 or newer is required. Ask IT to check the update.'
