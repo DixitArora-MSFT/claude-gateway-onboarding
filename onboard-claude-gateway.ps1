@@ -866,7 +866,7 @@ function Install-GatewayHelpers {
 @echo off
 setlocal DisableDelayedExpansion
 set "PSModulePath=%SystemRoot%\System32\WindowsPowerShell\v1.0\Modules"
-"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -File "%~dp0onboard-claude-gateway.ps1" -Credential
+"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File "%~dp0onboard-claude-gateway.ps1" -Credential
 exit /b %errorlevel%
 '@
     $helperPath = Join-Path $InstallRoot 'credential-helper.cmd'

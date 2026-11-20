@@ -70,6 +70,11 @@ terminal:
 powershell.exe -NoProfile -File "$env:USERPROFILE\Downloads\onboard-claude-gateway.ps1"
 ```
 
+Installed Windows credential helpers use `RemoteSigned` for their own PowerShell
+processes, so they do not depend on the execution policy of the onboarding
+terminal. They do not change user or machine execution-policy settings.
+Organization-enforced Group Policy still takes precedence.
+
 ### macOS
 
 Open **Terminal**, not VS Code's integrated terminal. Do not run with `sudo` or

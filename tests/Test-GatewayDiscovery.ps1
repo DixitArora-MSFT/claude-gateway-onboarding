@@ -557,12 +557,21 @@ try {
     }
     $helpers = Install-GatewayHelpers -Settings $helperSettings -InstallRoot (Join-Path $temp 'helpers with spaces') `
         -ScriptPath (Join-Path $repo 'onboard-claude-gateway.ps1')
-    $desktopResult = & $originalNativeCapture -FilePath $helpers.Desktop -Arguments @()
-    Assert-Equal $desktopResult.ExitCode 0 'Generated Desktop helper executes successfully'
-    Assert-Equal ($desktopResult.Output | ConvertFrom-Json).token $helperToken 'Desktop helper returns JSON only'
-    $codeResult = & $originalNativeCapture -FilePath $helpers.Code -Arguments @()
-    Assert-Equal $codeResult.ExitCode 0 'Generated Code helper executes successfully'
-    Assert-Equal $codeResult.Output $helperToken 'Code helper returns only the token'
+    $previousExecutionPolicy = $env:PSExecutionPolicyPreference
+    try {
+        foreach ($executionPolicy in @('Restricted', 'RemoteSigned')) {
+            $env:PSExecutionPolicyPreference = $executionPolicy
+            $desktopResult = & $originalNativeCapture -FilePath $helpers.Desktop -Arguments @()
+            Assert-Equal $desktopResult.ExitCode 0 "Desktop helper executes with inherited $executionPolicy policy"
+            Assert-Equal ($desktopResult.Output | ConvertFrom-Json).token $helperToken 'Desktop helper returns JSON only'
+            $codeResult = & $originalNativeCapture -FilePath $helpers.Code -Arguments @()
+            Assert-Equal $codeResult.ExitCode 0 "Code helper executes with inherited $executionPolicy policy"
+            Assert-Equal $codeResult.Output $helperToken 'Code helper returns only the token'
+            Assert-Equal $env:PSExecutionPolicyPreference $executionPolicy 'Helpers do not change the caller policy'
+        }
+    } finally {
+        $env:PSExecutionPolicyPreference = $previousExecutionPolicy
+    }
     $desktopDir = Join-Path $temp 'desktop'
     Install-DesktopConfiguration -Settings $settings -InstallRoot $installRoot `
         -HelperPath 'C:\helpers\token.cmd' -ConfigDirectory $desktopDir | Out-Null
